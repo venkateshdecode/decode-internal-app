@@ -1,0 +1,9 @@
+[server]
+fileWatcherType = "none"
+headless = true
+maxUploadSize = 4000
+maxMessageSize = 4000
+enableWebsocketCompression = true
+
+[browser]
+gatherUsageStats = false
