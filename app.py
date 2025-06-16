@@ -79,6 +79,19 @@ st.markdown("""
         color: #0c5460;
         margin: 1rem 0;
     }
+    .download-highlight {
+        padding: 1.5rem;
+        border-radius: 0.5rem;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        text-align: center;
+        margin: 2rem 0;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    }
+    .download-highlight h3 {
+        color: white !important;
+        margin-bottom: 1rem;
+    }
     .stProgress > div > div > div > div {
         background-color: #1f77b4;
     }
@@ -226,7 +239,7 @@ def get_frames(video_path, output_dir, video_format, max_image_length=500, extra
             cap = cv2.VideoCapture(video_path)
             
             if not cap.isOpened():
-                st.error(f"❌ Could not open video file: {video_path}")
+                st.error(f"❌ Could not open video file: {video_display_name}")
                 return []
             
             frame_paths = []
@@ -365,7 +378,7 @@ def process_video(video_path, output_base_folder, project_name, n_scene_frames=3
             st.success(f"🎬 Found {len(unique_scenes)} unique scenes with {len(scene_df)} total scene frames")
             
             # Copy ALL scene frames to output folder with proper naming
-            st.info("💾 Copying scene frames to output folder...")
+            st.info("💾 Preparing scene frames for download...")
             scene_frames = scene_df["scene_image_path"].tolist()
             copied_frame_paths = []
             
@@ -399,16 +412,7 @@ def process_video(video_path, output_base_folder, project_name, n_scene_frames=3
                 
                 progress_bar.progress((i + 1) / len(scene_frames))
             
-            st.success(f"✅ Successfully saved {len(copied_frame_paths)} frames to {output_folder_video}")
-            
-            # Show sample of created files
-            if copied_frame_paths:
-                st.info("📁 Sample of created files:")
-                sample_files = copied_frame_paths[:5]  # Show first 5 files
-                for file_path in sample_files:
-                    st.write(f"• {os.path.basename(file_path)}")
-                if len(copied_frame_paths) > 5:
-                    st.write(f"• ... and {len(copied_frame_paths) - 5} more files")
+            st.success(f"✅ Successfully prepared {len(copied_frame_paths)} frames for download")
             
             # Create results summary
             result_data = {
@@ -417,7 +421,7 @@ def process_video(video_path, output_base_folder, project_name, n_scene_frames=3
                 "num_scene_frames": len(scene_df),
                 "num_saved_frames": len(copied_frame_paths),
                 "output_path": output_folder_video,
-                "status": f"Success - saved {len(copied_frame_paths)} images"
+                "status": f"Success - prepared {len(copied_frame_paths)} images"
             }
             
             return result_data, None
@@ -452,16 +456,10 @@ def main():
         project_name = st.text_input(
             "Project Name", 
             value="video_extraction_project",
-            help="Name for your project (used in file naming)"
+            help="Name for your project (used in downloaded ZIP file name)"
         )
         
-        # Output folder configuration
-        st.subheader("📁 Output Settings")
-        output_base_folder = st.text_input(
-            "Output Base Folder Path",
-            value="./extracted_frames",
-            help="Base path where video folders will be created"
-        )
+        st.subheader("🎯 Extraction Settings")
         
         n_scene_frames = st.slider(
             "Frames per Scene", 
@@ -482,9 +480,12 @@ def main():
         extract_all_frames = st.checkbox(
             "Extract More Frames",
             value=True,
-            help="Helps gives much denser frame coverage, especially for high frame rate videos"
+            help="Provides much denser frame coverage, especially for high frame rate videos"
         )
         
+        st.markdown("---")
+        st.markdown("### 📥 How to Get Your Files")
+        st.info("After processing, use the **Download** button that appears below to get your extracted frames as a ZIP file.")
 
        
     # Main content area
@@ -512,10 +513,11 @@ def main():
         st.header("ℹ️ How it works")
         st.markdown("""
         1. **Upload** your video files
-        2. **Configure** extraction settings and output path
+        2. **Configure** extraction settings  
         3. **Process** videos to detect scenes
-        4. **Download** extracted frame images
-      
+        4. **Download** your extracted frames as a ZIP file
+        
+        💡 **Your files will be ready for download after processing!**
         """)
     
     # Processing section
@@ -528,119 +530,121 @@ def main():
             if not deps_ok:
                 st.warning(f"⚠️ {deps_msg} - Using mock scene detection")
             
-            # Create output directory
-            try:
-                os.makedirs(output_base_folder, exist_ok=True)
-                st.info(f"📁 Output base folder: {os.path.abspath(output_base_folder)}")
-            except Exception as e:
-                st.error(f"❌ Error creating output folder: {e}")
-                return
-            
-            results = []
-            
-            # Process each video
-            for i, uploaded_file in enumerate(uploaded_files):
-                st.markdown(f"### Processing Video {i+1}/{len(uploaded_files)}: {uploaded_file.name}")
+            # Create temporary output directory for processing
+            with tempfile.TemporaryDirectory() as output_base_folder:
+                results = []
                 
-                # Save uploaded file temporarily
-                with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
-                    tmp_file.write(uploaded_file.read())
-                    tmp_video_path = tmp_file.name
-                
-                try:
-                    # Process the video
-                    result, error = process_video(
-                        tmp_video_path, 
-                        output_base_folder,  # Changed from output_folder_defined
-                        project_name,
-                        n_scene_frames=n_scene_frames,
-                        image_length_max=image_length_max,
-                        extract_all_frames=extract_all_frames,
-                        original_filename=uploaded_file.name
-                    )
+                # Process each video
+                for i, uploaded_file in enumerate(uploaded_files):
+                    st.markdown(f"### Processing Video {i+1}/{len(uploaded_files)}: {uploaded_file.name}")
                     
-                    if error:
-                        st.error(f"❌ Error processing {uploaded_file.name}: {error}")
+                    # Save uploaded file temporarily
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
+                        tmp_file.write(uploaded_file.read())
+                        tmp_video_path = tmp_file.name
+                    
+                    try:
+                        # Process the video
+                        result, error = process_video(
+                            tmp_video_path, 
+                            output_base_folder,
+                            project_name,
+                            n_scene_frames=n_scene_frames,
+                            image_length_max=image_length_max,
+                            extract_all_frames=extract_all_frames,
+                            original_filename=uploaded_file.name
+                        )
+                        
+                        if error:
+                            st.error(f"❌ Error processing {uploaded_file.name}: {error}")
+                            results.append({
+                                "video_name": uploaded_file.name,
+                                "status": f"Error: {error}",
+                                "num_scenes": 0,
+                                "num_scene_frames": 0,
+                                "num_saved_frames": 0
+                            })
+                        else:
+                            results.append(result)
+                            
+                    except Exception as e:
+                        st.error(f"❌ Unexpected error processing {uploaded_file.name}: {str(e)}")
                         results.append({
                             "video_name": uploaded_file.name,
-                            "status": f"Error: {error}",
+                            "status": f"Error: {str(e)}",
                             "num_scenes": 0,
                             "num_scene_frames": 0,
                             "num_saved_frames": 0
                         })
-                    else:
-                        results.append(result)
-                        
-                except Exception as e:
-                    st.error(f"❌ Unexpected error processing {uploaded_file.name}: {str(e)}")
-                    results.append({
-                        "video_name": uploaded_file.name,
-                        "status": f"Error: {str(e)}",
-                        "num_scenes": 0,
-                        "num_scene_frames": 0,
-                        "num_saved_frames": 0
-                    })
-                finally:
-                    # Clean up temporary file
-                    if os.path.exists(tmp_video_path):
-                        os.unlink(tmp_video_path)
-                        
-                st.markdown("---")
-            
-            # Display results summary
-            st.header("📊 Processing Results")
-            
-            if results:
-                results_df = pd.DataFrame(results)
-                st.dataframe(results_df, use_container_width=True)
+                    finally:
+                        # Clean up temporary file
+                        if os.path.exists(tmp_video_path):
+                            os.unlink(tmp_video_path)
+                            
+                    st.markdown("---")
                 
-                # Calculate summary statistics
-                successful_videos = len([r for r in results if "Success" in r.get("status", "")])
-                total_scenes = sum([r.get("num_scenes", 0) for r in results])
-                total_frames = sum([r.get("num_saved_frames", 0) for r in results])
+                # Display results summary
+                st.header("📊 Processing Results")
                 
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    st.metric("Videos Processed", f"{successful_videos}/{len(uploaded_files)}")
-                with col2:
-                    st.metric("Total Scenes", total_scenes)
-                with col3:
-                    st.metric("Total Frames Saved", total_frames)
-                with col4:
-                    avg_frames = total_frames / successful_videos if successful_videos > 0 else 0
-                    st.metric("Avg Frames/Video", f"{avg_frames:.1f}")
-                
-                # Show output folder info
-                if successful_videos > 0:
-                    st.success(f"✅ All frames saved to: `{os.path.abspath(output_base_folder)}`")
+                if results:
+                    results_df = pd.DataFrame(results)
+                    st.dataframe(results_df, use_container_width=True)
                     
-                    # Show folder structure
-                    st.info("📂 Created folder structure:")
-                    for result in results:
-                        if "Success" in result.get("status", ""):
-                            video_folder = os.path.join(output_base_folder, result["video_name"])
-                            st.write(f"• `{video_folder}/` ({result['num_saved_frames']} frames)")
+                    # Calculate summary statistics
+                    successful_videos = len([r for r in results if "Success" in r.get("status", "")])
+                    total_scenes = sum([r.get("num_scenes", 0) for r in results])
+                    total_frames = sum([r.get("num_saved_frames", 0) for r in results])
                     
-                    # Create download ZIP
-                    st.info("📦 Creating download package...")
-                    try:
-                        zip_path = create_download_zip(output_base_folder, project_name)
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Videos Processed", f"{successful_videos}/{len(uploaded_files)}")
+                    with col2:
+                        st.metric("Total Scenes", total_scenes)
+                    with col3:
+                        st.metric("Total Frames", total_frames)
+                    with col4:
+                        avg_frames = total_frames / successful_videos if successful_videos > 0 else 0
+                        st.metric("Avg Frames/Video", f"{avg_frames:.1f}")
+                    
+                    # Create and offer download if successful
+                    if successful_videos > 0:
+                        st.markdown('<div class="download-highlight">', unsafe_allow_html=True)
+                        st.markdown("### 🎉 Processing Complete!")
+                        st.markdown(f"**{total_frames} frames** extracted from **{successful_videos} videos**")
                         
-                        with open(zip_path, "rb") as zip_file:
-                            st.download_button(
-                                label="📥 Download All Extracted Frames",
-                                data=zip_file.read(),
-                                file_name=f"{project_name}_extracted_frames.zip",
-                                mime="application/zip",
-                                use_container_width=True
-                            )
+                        # Create download ZIP
+                        with st.spinner("📦 Creating your download package..."):
+                            try:
+                                zip_path = create_download_zip(output_base_folder, project_name)
+                                
+                                with open(zip_path, "rb") as zip_file:
+                                    zip_data = zip_file.read()
+                                    
+                                st.download_button(
+                                    label="📥 Download Your Extracted Frames",
+                                    data=zip_data,
+                                    file_name=f"{project_name}_extracted_frames.zip",
+                                    mime="application/zip",
+                                    use_container_width=True,
+                                    type="primary"
+                                )
+                                
+                                st.success("✅ Your ZIP file is ready! Click the button above to download.")
+                                st.info("💡 The ZIP file will be saved to your Downloads folder")
+                                
+                            except Exception as e:
+                                st.error(f"❌ Error creating download package: {str(e)}")
                         
-                        st.success("✅ Processing complete! Download your extracted frames above.")
+                        st.markdown('</div>', unsafe_allow_html=True)
                         
-                    except Exception as e:
-                        st.error(f"Error creating download package: {str(e)}")
-            else:
-                st.warning("⚠️ No results to display.")
+                        # Show what's included in the download
+                        with st.expander("📂 What's included in your download", expanded=False):
+                            for result in results:
+                                if "Success" in result.get("status", ""):
+                                    st.write(f"**{result['video_name']}/** folder ({result['num_saved_frames']} frames)")
+                                    st.write(f"  └── Files: {result['video_name']}_01.jpg, {result['video_name']}_02.jpg, ...")
+                else:
+                    st.warning("⚠️ No results to display.")
     
     # Footer
     st.markdown("---")
