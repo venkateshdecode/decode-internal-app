@@ -17,9 +17,6 @@ import contextlib
 import os
 import warnings
 
-
-
-
 # st.set_option('server.maxUploadSize', 1000) 
 
 # Suppress FFmpeg warnings
@@ -118,7 +115,6 @@ st.markdown("""
     }
 </style>
 """, unsafe_allow_html=True)
-
 
 # Lazy imports to avoid startup issues
 @st.cache_resource
@@ -250,7 +246,7 @@ def image_resize(image_path, max_length):
     
     return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
 
-def get_frames(video_path, output_dir, video_format, max_image_length=500, extract_all_frames=False, display_name = None):
+def get_frames(video_path, output_dir, video_format, max_image_length=500, extract_all_frames=False, display_name=None):
     video_display_name = display_name if display_name else os.path.basename(video_path)
     try:
         with suppress_stderr():
