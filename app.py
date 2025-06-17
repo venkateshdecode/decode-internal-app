@@ -116,10 +116,8 @@ st.markdown("""
     .stProgress > div > div > div > div {
         background-color: #1f77b4;
     }
-
 </style>
 """, unsafe_allow_html=True)
-
 
 
 # Lazy imports to avoid startup issues
