@@ -19,6 +19,7 @@ import warnings
 
 
 
+
 # st.set_option('server.maxUploadSize', 1000) 
 
 # Suppress FFmpeg warnings
@@ -47,6 +48,26 @@ def suppress_stderr():
             yield
         finally:
             sys.stderr = old_stderr
+
+def get_documents_extracted_videos_path():
+    """Get the path to Documents/extracted_videos folder"""
+    try:
+        # Get the user's Documents folder
+        if os.name == 'nt':  # Windows
+            documents_path = os.path.join(os.path.expanduser('~'), 'Documents')
+        else:  # macOS/Linux
+            documents_path = os.path.join(os.path.expanduser('~'), 'Documents')
+        
+        # Create extracted_videos folder in Documents
+        extracted_videos_path = os.path.join(documents_path, 'extracted_videos')
+        os.makedirs(extracted_videos_path, exist_ok=True)
+        
+        return extracted_videos_path
+    except Exception as e:
+        # Fallback to current directory if Documents access fails
+        fallback_path = os.path.join(os.getcwd(), 'extracted_videos')
+        os.makedirs(fallback_path, exist_ok=True)
+        return fallback_path
 
 st.set_page_config(
     page_title="Video Scene Frame Extractor",
@@ -95,8 +116,11 @@ st.markdown("""
     .stProgress > div > div > div > div {
         background-color: #1f77b4;
     }
+
 </style>
 """, unsafe_allow_html=True)
+
+
 
 # Lazy imports to avoid startup issues
 @st.cache_resource
@@ -230,10 +254,6 @@ def image_resize(image_path, max_length):
 
 def get_frames(video_path, output_dir, video_format, max_image_length=500, extract_all_frames=False, display_name = None):
     video_display_name = display_name if display_name else os.path.basename(video_path)
-
-    """
-    Extract frames from video
-    """
     try:
         with suppress_stderr():
             cap = cv2.VideoCapture(video_path)
@@ -301,8 +321,8 @@ def get_frames(video_path, output_dir, video_format, max_image_length=500, extra
                     progress_bar.progress(min(i / total_frames_to_extract, 1.0))
                 
                 # Limit total frames to prevent memory issues
-                if success_count >= 500:  # Reasonable limit
-                    st.info(f"ℹ️ Reached frame limit of 500 frames for processing efficiency")
+                if success_count >= 1500:  # Reasonable limit
+                    #st.info(f"ℹ️ Reached frame limit of 500 frames for processing efficiency")
                     break
             
             progress_bar.progress(1.0)
@@ -353,10 +373,9 @@ def process_video(video_path, output_base_folder, project_name, n_scene_frames=3
             if not frame_paths:
                 return None, "No frames could be extracted from the video"
                 
-            st.success(f"✅ Extracted {len(frame_paths)} frames")
+            st.success(f"Extracted {len(frame_paths)} frames")
             
             # Create scene detector
-            st.info("🔍 Detecting scenes...")
             scene_detector = MockSceneDetector(
                 video_path=video_path, 
                 frame_paths=frame_paths, 
@@ -375,10 +394,10 @@ def process_video(video_path, output_base_folder, project_name, n_scene_frames=3
             )
             
             unique_scenes = scene_df["scene_number"].unique().tolist()
-            st.success(f"🎬 Found {len(unique_scenes)} unique scenes with {len(scene_df)} total scene frames")
+            st.success(f"Found {len(unique_scenes)} unique scenes with {len(scene_df)} total scene frames")
             
             # Copy ALL scene frames to output folder with proper naming
-            st.info("💾 Preparing scene frames for download...")
+            #st.info("💾 Preparing scene frames for download...")
             scene_frames = scene_df["scene_image_path"].tolist()
             copied_frame_paths = []
             
@@ -429,20 +448,37 @@ def process_video(video_path, output_base_folder, project_name, n_scene_frames=3
         except Exception as e:
             return None, str(e)
 
-def create_download_zip(output_base_folder, project_name):
-    """Create a ZIP file of all extracted frames"""
-    zip_path = os.path.join(output_base_folder, f"{project_name}_extracted_frames.zip")
-    
-    with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+def save_frames_to_documents(output_base_folder, project_name):
+    """Save extracted frames directly to Documents/extracted_videos folder"""
+    try:
+        # Get the Documents/extracted_videos path
+        documents_extracted_path = get_documents_extracted_videos_path()
+        
+        # Create project folder in Documents/extracted_videos
+        project_folder = os.path.join(documents_extracted_path, project_name)
+        os.makedirs(project_folder, exist_ok=True)
+        
+        # Copy all extracted frames to the project folder
+        total_copied = 0
         for root, dirs, files in os.walk(output_base_folder):
             for file in files:
-                if file.endswith(('.jpg', '.jpeg', '.png')) and not file.endswith('.zip'):
-                    file_path = os.path.join(root, file)
-                    # Preserve folder structure in ZIP
-                    arcname = os.path.relpath(file_path, output_base_folder)
-                    zipf.write(file_path, arcname)
-    
-    return zip_path
+                if file.endswith(('.jpg', '.jpeg', '.png')):
+                    source_path = os.path.join(root, file)
+                    # Maintain folder structure
+                    rel_path = os.path.relpath(root, output_base_folder)
+                    if rel_path == '.':
+                        dest_dir = project_folder
+                    else:
+                        dest_dir = os.path.join(project_folder, rel_path)
+                        os.makedirs(dest_dir, exist_ok=True)
+                    
+                    dest_path = os.path.join(dest_dir, file)
+                    shutil.copy2(source_path, dest_path)
+                    total_copied += 1
+        
+        return project_folder, total_copied
+    except Exception as e:
+        return None, 0
 
 def main():
     # Header
@@ -456,7 +492,7 @@ def main():
         project_name = st.text_input(
             "Project Name", 
             value="video_extraction_project",
-            help="Name for your project (used in downloaded ZIP file name)"
+            help="Name for your project folder in Documents/extracted_videos"
         )
         
         st.subheader("🎯 Extraction Settings")
@@ -484,8 +520,11 @@ def main():
         )
         
         st.markdown("---")
-        st.markdown("### 📥 How to Get Your Files")
-        st.info("After processing, use the **Download** button that appears below to get your extracted frames as a ZIP file.")
+        st.markdown("### 📁 Output Location")
+        documents_path = get_documents_extracted_videos_path()
+        #st.info(f"Files will be saved to:\n`{documents_path}`")
+        #st.markdown("### 📥 Access Options")
+        #st.info("After processing:\n• Access files directly from Documents folder\n• Use the 'Save extracted images' button to open the folder")
 
        
     # Main content area
@@ -515,9 +554,7 @@ def main():
         1. **Upload** your video files
         2. **Configure** extraction settings  
         3. **Process** videos to detect scenes
-        4. **Download** your extracted frames as a ZIP file
-        
-        💡 **Your files will be ready for download after processing!**
+        4. **Access** your extracted frames from Documents/extracted_videos folder
         """)
     
     # Processing section
@@ -606,43 +643,45 @@ def main():
                         avg_frames = total_frames / successful_videos if successful_videos > 0 else 0
                         st.metric("Avg Frames/Video", f"{avg_frames:.1f}")
                     
-                    # Create and offer download if successful
+                    # Save to Documents if successful
                     if successful_videos > 0:
-                        st.markdown('<div class="download-highlight">', unsafe_allow_html=True)
-                        st.markdown("### 🎉 Processing Complete!")
-                        st.markdown(f"**{total_frames} frames** extracted from **{successful_videos} videos**")
+                       # st.markdown('<div class="download-highlight">', unsafe_allow_html=True)
+                        st.markdown("# Processing Complete!")
+                        #st.markdown(f"**{total_frames} frames** extracted from **{successful_videos} videos**")
                         
-                        # Create download ZIP
-                        with st.spinner("📦 Creating your download package..."):
+                        # Save files to Documents/extracted_videos folder
+                        with st.spinner("💾 Saving files to Documents folder..."):
                             try:
-                                zip_path = create_download_zip(output_base_folder, project_name)
+                                project_folder, total_copied = save_frames_to_documents(output_base_folder, project_name)
                                 
-                                with open(zip_path, "rb") as zip_file:
-                                    zip_data = zip_file.read()
+                                if project_folder and total_copied > 0:
+                                    st.success(f"✅ {total_copied} files saved to Documents folder!")
+                                    #st.info(f"📂 **Location:** `{project_folder}`")
                                     
-                                st.download_button(
-                                    label="📥 Download Your Extracted Frames",
-                                    data=zip_data,
-                                    file_name=f"{project_name}_extracted_frames.zip",
-                                    mime="application/zip",
-                                    use_container_width=True,
-                                    type="primary"
-                                )
-                                
-                                st.success("✅ Your ZIP file is ready! Click the button above to download.")
-                                st.info("💡 The ZIP file will be saved to your Downloads folder")
-                                
+                                    # Only show the "Save extracted images" button
+                                    if st.button("🗂️ Save extracted images", use_container_width=True):
+                                        # Try to open the folder in file explorer
+                                        try:
+                                            if os.name == 'nt':  # Windows
+                                                os.startfile(project_folder)
+                                            elif sys.platform == 'darwin':  # macOS
+                                                os.system(f'open "{project_folder}"')
+                                            else:  # Linux
+                                                os.system(f'xdg-open "{project_folder}"')
+                                        except:
+                                            st.info("Unable to open folder automatically. Please navigate manually to the location shown above.")
+                                    
+                                    #st.markdown("---")
+                                    st.success("")
+                                    
+                                else:
+                                    st.error("❌ Error saving files to Documents folder")
+                                    
                             except Exception as e:
-                                st.error(f"❌ Error creating download package: {str(e)}")
+                                st.error(f"❌ Error saving to Documents folder: {str(e)}")
                         
                         st.markdown('</div>', unsafe_allow_html=True)
-                        
-                        # Show what's included in the download
-                        with st.expander("📂 What's included in your download", expanded=False):
-                            for result in results:
-                                if "Success" in result.get("status", ""):
-                                    st.write(f"**{result['video_name']}/** folder ({result['num_saved_frames']} frames)")
-                                    st.write(f"  └── Files: {result['video_name']}_01.jpg, {result['video_name']}_02.jpg, ...")
+
                 else:
                     st.warning("⚠️ No results to display.")
     
