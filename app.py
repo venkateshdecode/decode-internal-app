@@ -70,6 +70,32 @@ def get_documents_extracted_videos_path():
         os.makedirs(fallback_path, exist_ok=True)
         return fallback_path
 
+def create_zip_download(output_base_folder, project_name):
+    """Create a ZIP file of all extracted frames for download"""
+    try:
+        import io
+        
+        # Create ZIP content directly in memory
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for root, dirs, files in os.walk(output_base_folder):
+                for file in files:
+                    if file.endswith(('.jpg', '.jpeg', '.png')):
+                        file_path = os.path.join(root, file)
+                        # Create archive path maintaining folder structure
+                        arcname = os.path.relpath(file_path, output_base_folder)
+                        zip_file.write(file_path, arcname)
+        
+        # Get the ZIP content
+        zip_content = zip_buffer.getvalue()
+        zip_buffer.close()
+        
+        return zip_content
+    except Exception as e:
+        st.error(f"Error creating ZIP file: {str(e)}")
+        return None
+
 st.set_page_config(
     page_title="Video Scene Frame Extractor",
     page_icon="🎬",
@@ -236,13 +262,12 @@ def get_video_format(video_path):
     except Exception as e:
         return "unknown", 25
 
-def image_resize(image_path, max_length):
+def resize_image_maintain_aspect_ratio(image, max_length):
     """Resize image to max length while maintaining aspect ratio"""
-    img = Image.open(image_path)
-    width, height = img.size
+    width, height = image.size
     
     if max(width, height) <= max_length:
-        return img
+        return image
     
     if width > height:
         new_width = max_length
@@ -251,7 +276,12 @@ def image_resize(image_path, max_length):
         new_height = max_length
         new_width = int(width * max_length / height)
     
-    return img.resize((new_width, new_height), Image.Resampling.LANCZOS)
+    return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+def image_resize(image_path, max_length):
+    """Resize image to max length while maintaining aspect ratio"""
+    img = Image.open(image_path)
+    return resize_image_maintain_aspect_ratio(img, max_length)
 
 def get_frames(video_path, output_dir, video_format, max_image_length=500, extract_all_frames=False, display_name = None):
     video_display_name = display_name if display_name else os.path.basename(video_path)
@@ -298,16 +328,13 @@ def get_frames(video_path, output_dir, video_format, max_image_length=500, extra
                     frame_filename = f"{success_count:06d}.jpg"
                     frame_path = os.path.join(output_dir, frame_filename)
                     
-                    # Convert to PIL and resize
+                    # Convert to PIL and resize properly maintaining aspect ratio
                     pil_image = Image.fromarray(frame_rgb)
                     if max(pil_image.size) > max_image_length:
-                        pil_image = pil_image.resize(
-                            (min(pil_image.size[0], max_image_length), 
-                             min(pil_image.size[1], max_image_length)), 
-                            Image.Resampling.LANCZOS
-                        )
+                        pil_image = resize_image_maintain_aspect_ratio(pil_image, max_image_length)
                     
-                    pil_image.save(frame_path, 'JPEG', quality=90, optimize=True)
+                    pil_image.save(frame_path, 'JPEG', quality=105, optimize=True, subsampling=0)
+
                     frame_paths.append(frame_path)
                     success_count += 1
                     
@@ -414,16 +441,13 @@ def process_video(video_path, output_base_folder, project_name, n_scene_frames=3
                     scene_frame_output_path = os.path.join(output_folder_video, output_frame_name)
                     
                     try:
-                        # Copy and potentially resize
+                        # Copy and potentially resize while maintaining aspect ratio
                         img = Image.open(scene_frame)
                         if max(img.size) > image_length_max:
-                            img = img.resize(
-                                (min(img.size[0], image_length_max), 
-                                 min(img.size[1], image_length_max)), 
-                                Image.Resampling.LANCZOS
-                            )
+                            img = resize_image_maintain_aspect_ratio(img, image_length_max)
                         
-                        img.save(scene_frame_output_path, 'JPEG', quality=90)
+                        img.save(scene_frame_output_path, 'JPEG', quality=105, optimize=True, subsampling=0)
+
                         copied_frame_paths.append(scene_frame_output_path)
                         frame_counter += 1
                         
@@ -493,7 +517,7 @@ def main():
         project_name = st.text_input(
             "Project Name", 
             value="video_extraction_project",
-            help="Name for your project folder in Documents/extracted_videos"
+            help="Name for your project folder"
         )
         
         st.subheader("🎯 Extraction Settings")
@@ -509,8 +533,8 @@ def main():
         image_length_max = st.slider(
             "Max Image Size (pixels)", 
             min_value=200, 
-            max_value=1000, 
-            value=500,
+            max_value=2100,
+            value=1000,
             help="Maximum width or height of extracted frames"
         )
         
@@ -519,14 +543,6 @@ def main():
             value=True,
             help="Provides much denser frame coverage, especially for high frame rate videos"
         )
-        
-        #st.markdown("---")
-        #st.markdown("### 📁 Output Location")
-        #documents_path = get_documents_extracted_videos_path()
-        #st.info(f"Files will be saved to:\n`{documents_path}`")
-        #st.markdown("### 📥 Access Options")
-        #st.info("After processing:\n• Access files directly from Documents folder\n• Use the 'Save extracted images' button to open the folder")
-
        
     # Main content area
     col1, col2 = st.columns([2, 1])
@@ -555,7 +571,7 @@ def main():
         1. **Upload** your video files
         2. **Configure** extraction settings  
         3. **Process** videos to detect scenes
-        4. **Access** your extracted frames from Documents/extracted_videos folder
+        4. **Download** your extracted frames as a ZIP file
         """)
     
     # Processing section
@@ -644,44 +660,32 @@ def main():
                         avg_frames = total_frames / successful_videos if successful_videos > 0 else 0
                         st.metric("Avg Frames/Video", f"{avg_frames:.1f}")
                     
-                    # Save to Documents if successful
+                    # Create download if successful
                     if successful_videos > 0:
-                       # st.markdown('<div class="download-highlight">', unsafe_allow_html=True)
                         st.markdown("# Processing Complete!")
-                        #st.markdown(f"**{total_frames} frames** extracted from **{successful_videos} videos**")
                    
-                        with st.spinner("💾 Saving files to One Drive Documents folder..."):
+                        with st.spinner("📦 Creating download package..."):
                             try:
-                                #project_folder, total_copied = save_frames_to_documents(output_base_folder, project_name)
-                                project_folder, total_copied = save_frames_to_onedrive(output_base_folder, project_name)
-
-                                if project_folder and total_copied > 0:
-                                    st.success(f"✅ {total_copied} files saved to One Drive Documents folder!")
-                                    #st.info(f"📂 **Location:** `{project_folder}`")
+                                # Create ZIP file for download
+                                zip_content = create_zip_download(output_base_folder, project_name)
+                                
+                                if zip_content:
+                                    st.success(f"✅ {total_frames} frames ready for download!")
                                     
-                                    # Only show the "Save extracted images" button
-                                    if st.button("🗂️ Save extracted images to your One Drive", use_container_width=True):
-                                        # Try to open the folder in file explorer
-                                        try:
-                                            if os.name == 'nt':  # Windows
-                                                os.startfile(project_folder)
-                                            elif sys.platform == 'darwin':  # macOS
-                                                os.system(f'open "{project_folder}"')
-                                            else:  # Linux
-                                                os.system(f'xdg-open "{project_folder}"')
-                                        except:
-                                            st.info("Unable to open folder automatically. Please navigate manually to the location shown above.")
-                                    
-                                    #st.markdown("---")
-                                    st.success("")
+                                    # Download button
+                                    st.download_button(
+                                        label="📥 Download Extracted Frames",
+                                        data=zip_content,
+                                        file_name=f"{project_name}_extracted_frames.zip",
+                                        mime="application/zip",
+                                        use_container_width=True
+                                    )
                                     
                                 else:
-                                    st.error("❌ Error saving files to Documents folder")
+                                    st.error("❌ Error creating download package")
                                     
                             except Exception as e:
-                                st.error(f"❌ Error saving to Documents folder: {str(e)}")
-                        
-                        st.markdown('</div>', unsafe_allow_html=True)
+                                st.error(f"❌ Error preparing download: {str(e)}")
 
                 else:
                     st.warning("⚠️ No results to display.")
