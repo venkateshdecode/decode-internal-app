@@ -1,1995 +1,703 @@
-import os
-import re
-import tempfile
-import zipfile
 import streamlit as st
-from pathlib import Path
-from collections import defaultdict
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import (
-    SimpleDocTemplate, Table, TableStyle, Image as RLImage, Paragraph, Spacer, PageBreak, KeepInFrame
-)
-from reportlab.lib.styles import getSampleStyleSheet
-from reportlab.lib import colors
-from PIL import Image as PILImage
-import io
-import shutil
-import cv2
+import os
 import pandas as pd
 import numpy as np
+import shutil
+import zipfile
+from pathlib import Path
+from tqdm import tqdm
+import cv2
+from PIL import Image
+import tempfile
+import time
+import warnings
+import logging
+import sys
+import contextlib
+import os
+import warnings
+from get_onedrive import save_frames_to_onedrive
 
-# Configure Streamlit page
+
+
+
+# st.set_option('server.maxUploadSize', 1000) 
+
+# Suppress FFmpeg warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+warnings.filterwarnings('ignore')
+
+# Complete suppression of all OpenCV and other warnings
+warnings.filterwarnings('ignore')
+os.environ['OPENCV_LOG_LEVEL'] = 'SILENT'
+os.environ['OPENCV_VIDEOIO_DEBUG'] = '0'
+os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
+os.environ['OPENCV_VIDEOIO_PRIORITY_INTEL_MFX'] = '0'
+cv2.setLogLevel(0)
+
+# Suppress all logging
+logging.getLogger().setLevel(logging.CRITICAL)
+logging.getLogger('cv2').setLevel(logging.CRITICAL)
+
+# Context manager to completely suppress stderr
+@contextlib.contextmanager
+def suppress_stderr():
+    with open(os.devnull, "w") as devnull:
+        old_stderr = sys.stderr
+        sys.stderr = devnull
+        try:
+            yield
+        finally:
+            sys.stderr = old_stderr
+
+def get_documents_extracted_videos_path():
+    """Get the path to Documents/extracted_videos folder"""
+    try:
+        # Get the user's Documents folder
+        if os.name == 'nt':  # Windows
+            documents_path = os.path.join(os.path.expanduser('~'), 'Documents')
+        else:  # macOS/Linux
+            documents_path = os.path.join(os.path.expanduser('~'), 'Documents')
+        
+        # Create extracted_videos folder in Documents
+        extracted_videos_path = os.path.join(documents_path, 'extracted_videos')
+        os.makedirs(extracted_videos_path, exist_ok=True)
+        
+        return extracted_videos_path
+    except Exception as e:
+        # Fallback to current directory if Documents access fails
+        fallback_path = os.path.join(os.getcwd(), 'extracted_videos')
+        os.makedirs(fallback_path, exist_ok=True)
+        return fallback_path
+
+def create_zip_download(output_base_folder, project_name):
+    """Create a ZIP file of all extracted frames for download"""
+    try:
+        import io
+        
+        # Create ZIP content directly in memory
+        zip_buffer = io.BytesIO()
+        
+        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+            for root, dirs, files in os.walk(output_base_folder):
+                for file in files:
+                    if file.endswith(('.jpg', '.jpeg', '.png')):
+                        file_path = os.path.join(root, file)
+                        # Create archive path maintaining folder structure
+                        arcname = os.path.relpath(file_path, output_base_folder)
+                        zip_file.write(file_path, arcname)
+        
+        # Get the ZIP content
+        zip_content = zip_buffer.getvalue()
+        zip_buffer.close()
+        
+        return zip_content
+    except Exception as e:
+        st.error(f"Error creating ZIP file: {str(e)}")
+        return None
+
 st.set_page_config(
-    page_title="Brand Assets Tools",
-    page_icon="🔧",
-    layout="wide"
+    page_title="Video Scene Frame Extractor",
+    page_icon="🎬",
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-# Defined file types
-ALLOWED_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
-ALLOWED_TEXT_EXTENSIONS = {'.txt', '.md', '.csv'}
-ALL_ALLOWED_EXTENSIONS = ALLOWED_IMAGE_EXTENSIONS.union(ALLOWED_TEXT_EXTENSIONS)
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 2.5rem;
+        color: #1f77b4;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .success-box {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        background-color: #d4edda;
+        border: 1px solid #c3e6cb;
+        color: #155724;
+        margin: 1rem 0;
+    }
+    .info-box {
+        padding: 1rem;
+        border-radius: 0.5rem;
+        background-color: #d1ecf1;
+        border: 1px solid #bee5eb;
+        color: #0c5460;
+        margin: 1rem 0;
+    }
+    .download-highlight {
+        padding: 1.5rem;
+        border-radius: 0.5rem;
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        color: white;
+        text-align: center;
+        margin: 2rem 0;
+        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
+    }
+    .download-highlight h3 {
+        color: white !important;
+        margin-bottom: 1rem;
+    }
+    .stProgress > div > div > div > div {
+        background-color: #1f77b4;
+    }
 
-# Helper functions from both files
-def extract_zip_to_temp(uploaded_file):
-    """Extract uploaded zip file to temporary directory"""
-    temp_dir = tempfile.mkdtemp()
-    with zipfile.ZipFile(uploaded_file, 'r') as zip_ref:
-        zip_ref.extractall(temp_dir)
-    return temp_dir
+</style>
+""", unsafe_allow_html=True)
 
-def extract_images_from_xlsx(xlsx_file, output_dir):
-    """Extract images from Excel file to specified directory"""
-    count = 0
-    extracted_files = []
-    
+
+
+# Lazy imports to avoid startup issues
+@st.cache_resource
+def import_dependencies():
+    """Import heavy dependencies with error handling"""
     try:
-        with zipfile.ZipFile(xlsx_file, 'r') as z:
-            for file_info in z.infolist():
-                if file_info.filename.startswith("xl/media/"):
-                    filename = Path(file_info.filename).name
-                    target_path = Path(output_dir) / filename
+        import scenedetect
+        import timm
+        import sklearn
+        return True, "All dependencies loaded successfully"
+    except ImportError as e:
+        return False, f"Missing dependency: {str(e)}"
+
+def install_missing_packages():
+    """Install missing packages"""
+    packages = [
+        "scenedetect==0.5.5",
+        "opencv-python==4.5.3.56", 
+        "timm",
+        "scikit-learn",
+        "tqdm"
+    ]
+    
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+    
+    for i, package in enumerate(packages):
+        status_text.text(f"Installing {package}...")
+        os.system(f"pip install {package} --quiet")
+        progress_bar.progress((i + 1) / len(packages))
+        time.sleep(0.5)
+    
+    status_text.text("All packages installed!")
+    time.sleep(1)
+    st.experimental_rerun()
+
+# Mock classes for when dependencies aren't available
+class MockEmbedder:
+    def __init__(self, model):
+        self.model = model
+
+class MockSceneDetector:
+    def __init__(self, video_path, frame_paths, fps, debug_handler=None, verbose=False):
+        self.video_path = video_path
+        self.frame_paths = frame_paths
+        self.fps = fps
+    
+    def detect_scenes(self, n_scene_frames=3, embedder=None):
+        """
+        Enhanced scene detection to match notebook output
+        Returns more frames per scene and more scenes overall
+        """
+        num_frames = len(self.frame_paths)
+        
+        scenes_per_video = max(3, num_frames // 5)  
+        frames_per_scene = min(n_scene_frames * 2, 8)         
+        scene_data = []
+        frame_idx = 0
+        
+        for scene_num in range(scenes_per_video):
+            scene_start_time = scene_num * 3.0
+            scene_end_time = (scene_num + 1) * 3.0
+            
+            # Add multiple frames per scene to match notebook output
+            frames_in_this_scene = min(frames_per_scene, num_frames - frame_idx)
+            
+            for frame_in_scene in range(frames_in_this_scene):
+                if frame_idx < len(self.frame_paths):
+                    scene_data.append({
+                        'scene_number': scene_num,
+                        'scene_image_path': self.frame_paths[frame_idx],
+                        'duration': scene_end_time - scene_start_time,
+                        'start_time': scene_start_time + (frame_in_scene * 0.5),
+                        'end_time': scene_start_time + ((frame_in_scene + 1) * 0.5),
+                        'frame_in_scene': frame_in_scene
+                    })
+                    frame_idx += 1
                     
-                    with z.open(file_info) as source, open(target_path, 'wb') as target:
-                        shutil.copyfileobj(source, target)
-                    
-                    extracted_files.append(str(target_path))
-                    count += 1
-        
-        return count, extracted_files, None
-    except Exception as e:
-        return 0, [], str(e)
-
-def extract_brand(file_stem):
-    """Extract brand name from filename using pattern matching"""
-    parts = re.split(r'[ _\-]', file_stem)
-    return re.sub(r'[^a-z0-9]', '', parts[0].lower()) if parts else "unknown"
-
-def erkenne_marken_aus_ordnern(input_folder):
-    """Recognize brands from subfolders (original method)"""
-    try:
-        return sorted([
-            f for f in os.listdir(input_folder)
-            if os.path.isdir(os.path.join(input_folder, f)) and not f.startswith('.')
-        ])
-    except Exception as e:
-        st.error(f"Error reading folders: {str(e)}")
-        return []
-
-def get_files_by_marke(input_folder, marken):
-    """Get files per brand from folders"""
-    spalteninhalte = {marke: [] for marke in marken}
-    
-    for marke in marken:
-        folder_path = os.path.join(input_folder, marke)
-        if os.path.isdir(folder_path):
-            try:
-                dateien = [
-                    os.path.join(folder_path, f)
-                    for f in os.listdir(folder_path)
-                    if not f.startswith(".") and os.path.splitext(f)[1].lower() in ALL_ALLOWED_EXTENSIONS
-                ]
-                spalteninhalte[marke] = dateien
-            except Exception as e:
-                st.warning(f"Error reading files from {marke}: {str(e)}")
-                spalteninhalte[marke] = []
-    
-    return spalteninhalte
-
-def get_asset_cell(file_path, filename, col_count):
-    """Create optimized asset cell for PDF with better image handling"""
-    ext = Path(file_path).suffix.lower()
-    styles = getSampleStyleSheet()
-    
-    try:
-        if ext in ALLOWED_IMAGE_EXTENSIONS:
-            with PILImage.open(file_path) as img:
-                orig_width, orig_height = img.size
-                available_width = A4[0] - 40
-                max_width = available_width / col_count
-                max_height = 120
-
-                aspect_ratio = orig_width / orig_height
-                width = max_width
-                height = width / aspect_ratio
-
-                if height > max_height:
-                    height = max_height
-                    width = height * aspect_ratio
-
-                buffer = io.BytesIO()
-                img.convert("RGB").save(buffer, format='PNG')
-                buffer.seek(0)
-                rl_img = RLImage(buffer, width=width, height=height)
-
-                frame = KeepInFrame(max_width, max_height + 30, content=[
-                    rl_img,
-                    Paragraph(filename, styles['Normal'])
-                ], hAlign='CENTER')
-
-                return frame
-        else:
-            return Paragraph(f"{filename}", styles['Normal'])
-    except Exception as e:
-        return Paragraph(f"[Image Error]<br/>{filename}", styles['Normal'])
-
-def build_marken_einzelseiten(alle_dateien_pro_marke, styles, gesamtbreite):
-    """Build individual brand overview pages (original method)"""
-    elements = []
-    max_bildhoehe = 100
-
-    for marke, dateien in alle_dateien_pro_marke.items():
-        elements.append(Paragraph(f"Brand Overview: {marke}", styles['Heading2']))
-        elements.append(Spacer(1, 12))
-        elements.append(Paragraph(f"<b>Total Assets:</b> {len(dateien)}", styles['Normal']))
-        elements.append(Spacer(1, 12))
-
-        if not dateien:
-            elements.append(Paragraph("No assets found in this brand folder.", styles['Normal']))
-            elements.append(PageBreak())
-            continue
-
-        table_data = []
-        row_data = []
-        spaltenbreite = gesamtbreite / 3
-
-        for i, file_path in enumerate(dateien):
-            ext = os.path.splitext(file_path)[1].lower()
-            filename = os.path.basename(file_path)
-
-            if ext in ALLOWED_IMAGE_EXTENSIONS:
-                try:
-                    pil_img = PILImage.open(file_path)
-                    width, height = pil_img.size
-                    aspect = height / width
-                    new_width = spaltenbreite * 0.9
-                    new_height = min(new_width * aspect, max_bildhoehe)
-                    new_width = new_height / aspect
-
-                    img = RLImage(file_path, width=new_width, height=new_height)
-                    cell = [img, Spacer(1, 4), Paragraph(filename, styles['Normal'])]
-                except Exception as e:
-                    cell = Paragraph(f"{filename} (Error loading image)", styles['Normal'])
-            else:
-                cell = Paragraph(f"{filename}", styles['Normal'])
-
-            row_data.append(cell)
-            if len(row_data) == 3:
-                table_data.append(row_data)
-                row_data = []
-
-        if row_data:
-            while len(row_data) < 3:
-                row_data.append("")
-            table_data.append(row_data)
-
-        if table_data:
-            table = Table(table_data, colWidths=[spaltenbreite] * 3)
-            table.setStyle(TableStyle([
-                ("GRID", (0, 0), (-1, -1), 1, colors.grey),
-                ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ]))
-            elements.append(table)
-        
-        elements.append(PageBreak())
-    
-    return elements
-
-def add_brand_pages(elements, marken_spalten, renamed_files_by_folder_and_marke):
-    """Add brand overview pages with optimized layout"""
-    styles = getSampleStyleSheet()
-    for nummer, marke in marken_spalten:
-        assets = []
-        for folder in renamed_files_by_folder_and_marke:
-            assets.extend(renamed_files_by_folder_and_marke[folder].get(marke, []))
-
-        if not assets:
-            continue
-
-        elements.append(PageBreak())
-        elements.append(Paragraph(f"<b>Brand Overview: {nummer} – {marke}</b>", styles['Heading2']))
-        elements.append(Spacer(1, 6))
-        elements.append(Paragraph(f"Number of assets: {len(assets)}", styles['Normal']))
-        elements.append(Spacer(1, 10))
-
-        headers = ["Asset"] * 4
-        data = [headers]
-        row = []
-        for i, (pfad, name) in enumerate(assets):
-            cell = get_asset_cell(pfad, name, 4)
-            row.append(cell)
-            if len(row) == 4:
-                data.append(row)
-                row = []
-        if row:
-            row.extend([""] * (4 - len(row)))
-            data.append(row)
-
-        table = Table(data, colWidths=(A4[0] - 40) / 4)
-        table.setStyle(TableStyle([
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ]))
-        elements.append(table)
-
-def analyze_files_by_filename(input_folder):
-    """Analyze files by extracting brand names from filenames"""
-    dateien = []
-    marken_set = set()
-    renamed_files_by_folder_and_marke = defaultdict(lambda: defaultdict(list))
-
-    for subfolder in sorted(Path(input_folder).iterdir()):
-        if not subfolder.is_dir():
-            continue
-
-        for file in sorted(subfolder.iterdir()):
-            if file.suffix.lower() not in ALL_ALLOWED_EXTENSIONS:
-                continue
-            marke = extract_brand(file.stem)
-            marken_set.add(marke)
-            dateien.append({
-                "original_file": file,
-                "original_folder": subfolder.name,
-                "marke": marke
-            })
-
-    for eintrag in dateien:
-        orig = eintrag["original_file"]
-        marke = eintrag["marke"]
-        folder_name = eintrag["original_folder"]
-        renamed_files_by_folder_and_marke[folder_name][marke].append((orig, orig.name))
-
-    return marken_set, renamed_files_by_folder_and_marke, dateien
-
-def generate_pdf_report(input_folder, erste_marke=None):
-    """Generate the complete PDF report (original method)"""
-    styles = getSampleStyleSheet()
-    gesamtbreite = 480
-
-    marken = erkenne_marken_aus_ordnern(input_folder)
-    if not marken:
-        return None, "No brand folders found in the uploaded zip file."
-
-    # Reorder brands if specified
-    if erste_marke and erste_marke in marken:
-        marken = [erste_marke] + [m for m in marken if m != erste_marke]
-
-    dateien_pro_marke = get_files_by_marke(input_folder, marken)
-    total_all = sum(len(dateien_pro_marke[marke]) for marke in marken)
-
-    alle_elements = []
-
-    # Overview page
-    alle_elements.append(Paragraph("Brand Assets Overview", styles['Title']))
-    alle_elements.append(Spacer(1, 20))
-    
-    übersicht_text = ", ".join([f"{marke}: {len(dateien_pro_marke[marke])}" for marke in marken])
-    alle_elements.append(Paragraph(f"<b>Assets per brand:</b> {übersicht_text}", styles['Normal']))
-    alle_elements.append(Spacer(1, 12))
-    alle_elements.append(Paragraph(f"<b>Total assets:</b> {total_all}", styles['Normal']))
-    alle_elements.append(PageBreak())
-
-    # Individual brand pages
-    markenseiten = build_marken_einzelseiten(dateien_pro_marke, styles, gesamtbreite)
-    alle_elements.extend(markenseiten)
-
-    # Generate PDF
-    pdf_buffer = io.BytesIO()
-    doc = SimpleDocTemplate(pdf_buffer, pagesize=A4)
-    
-    try:
-        doc.build(alle_elements)
-        pdf_buffer.seek(0)
-        return pdf_buffer, None
-    except Exception as e:
-        return None, f"Error generating PDF: {str(e)}"
-
-def generate_filename_based_pdf_report(input_folder, erste_marke=None):
-    """Generate PDF report based on filename brand analysis"""
-    marken_set, renamed_files_by_folder_and_marke, all_files = analyze_files_by_filename(input_folder)
-    
-    if not marken_set:
-        return None, "No brands found in filenames."
-
-    # Create brand index
-    marken_index = {}
-    if erste_marke and erste_marke in marken_set:
-        marken_index[erste_marke] = "01"
-        aktuelle_nummer = 2
-        for marke in sorted(marken_set):
-            if marke != erste_marke:
-                marken_index[marke] = f"{aktuelle_nummer:02d}"
-                aktuelle_nummer += 1
-    else:
-        for i, marke in enumerate(sorted(marken_set), 1):
-            marken_index[marke] = f"{i:02d}"
-
-    # Generate PDF
-    pdf_buffer = io.BytesIO()
-    doc = SimpleDocTemplate(pdf_buffer, pagesize=A4, leftMargin=20, rightMargin=20, topMargin=40, bottomMargin=30)
-    elements = []
-    styles = getSampleStyleSheet()
-
-    nummer_zu_marke = {v: k for k, v in marken_index.items()}
-    marken_spalten = sorted(nummer_zu_marke.items())
-
-    # Overview by folder
-    for folder in sorted(renamed_files_by_folder_and_marke):
-        elements.append(Paragraph(f"<b>Folder: {folder}</b>", styles['Heading2']))
-
-        abschnitt = renamed_files_by_folder_and_marke[folder]
-        total = 0
-        lines = []
-        for nummer, marke in marken_spalten:
-            count = len(abschnitt.get(marke, []))
-            total += count
-            lines.append(f"{nummer} ({marke}): {count}")
-        lines.append(f"Total: {total}")
-        elements.append(Paragraph("<br/>".join(lines), styles['Normal']))
-        elements.append(Spacer(1, 10))
-
-        headers = [f"{nummer} ({marke})" for nummer, marke in marken_spalten]
-        data = [headers]
-        col_data = []
-        max_rows = 0
-        for _, marke in marken_spalten:
-            eintraege = abschnitt.get(marke, [])
-            zellen = [get_asset_cell(p, n, len(headers)) for p, n in eintraege]
-            col_data.append(zellen)
-            max_rows = max(max_rows, len(zellen))
-
-        for i in range(max_rows):
-            row = []
-            for col in col_data:
-                row.append(col[i] if i < len(col) else "")
-            data.append(row)
-
-        col_width = (A4[0] - 40) / len(headers)
-        t = Table(data, colWidths=[col_width] * len(headers))
-        t.setStyle(TableStyle([
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ]))
-        elements.append(t)
-        elements.append(PageBreak())
-
-    # Total overview
-    elements.append(Paragraph("<b>Total Overview</b>", styles['Heading2']))
-    global_counts = defaultdict(int)
-    for folder_data in renamed_files_by_folder_and_marke.values():
-        for marke, daten in folder_data.items():
-            global_counts[marke] += len(daten)
-    
-    gesamt = 0
-    summary = []
-    for nummer, marke in marken_spalten:
-        count = global_counts[marke]
-        summary.append(f"{marke}: {count} assets")
-        gesamt += count
-    summary.append(f"Total number of all assets: {gesamt}")
-    elements.append(Paragraph("<br/>".join(summary), styles['Normal']))
-
-    # Add brand pages
-    add_brand_pages(elements, marken_spalten, renamed_files_by_folder_and_marke)
-
-    try:
-        doc.build(elements)
-        pdf_buffer.seek(0)
-        return pdf_buffer, None
-    except Exception as e:
-        return None, f"Error generating PDF: {str(e)}"
-
-# Add these imports at the top of your file
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
-from reportlab.lib.pagesizes import A4
-from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Image, PageBreak, Table, TableStyle
-from reportlab.lib import colors
-from reportlab.lib.units import inch
-import io
-import os
-import zipfile
-
-def pdf_generator_tool():
-    st.header("Brand Assets PDF Generator")
-    st.markdown("Upload a zip file containing brand assets to generate a comprehensive PDF report.")
-    
-    # Analysis method selection
-    analysis_method = st.radio(
-        "Choose analysis method:",
-        ["Folder-based analysis", "Filename-based analysis"],
-        help="Folder-based: analyzes brands based on folder structure. Filename-based: extracts brand names from filenames (supports both 'Brand*product' and 'Brand_product' patterns)."
-    )
-    
-    # File upload
-    uploaded_file = st.file_uploader(
-        "Choose a ZIP file",
-        type=['zip'],
-        help="Upload a zip file containing your brand assets.",
-        key="pdf_zip_upload"
-    )
-    
-    if uploaded_file is not None:
-        try:
-            # Extract zip file
-            with st.spinner("Extracting zip file..."):
-                temp_dir = extract_zip_to_temp(uploaded_file)
-            
-            # Find the actual input folder (in case zip has a root folder)
-            input_folder = temp_dir
-            items = os.listdir(temp_dir)
-            if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
-                input_folder = os.path.join(temp_dir, items[0])
-            
-            if analysis_method == "Folder-based analysis":
-                # Original folder-based analysis
-                marken = erkenne_marken_aus_ordnern(input_folder)
-                
-                if not marken:
-                    st.error("No brand folders found in the uploaded zip file.")
-                    st.info("Make sure your zip file contains folders named after your brands, with assets inside each folder.")
-                    return
-                
-                st.success(f"Found brands: {', '.join(marken)}")
-                
-                # Get file counts for processing
-                dateien_pro_marke = get_files_by_marke(input_folder, marken)
-                
-                # Options
-                erste_marke = st.selectbox(
-                    "Which brand should appear first in the overview?",
-                    options=["Alphabetical order"] + marken
-                )
-                erste_marke = erste_marke if erste_marke != "Alphabetical order" else None
-                
-                # Generate PDF button
-                if st.button("Generate PDF Report", type="primary"):
-                    with st.spinner("Generating PDF report..."):
-                        pdf_buffer, error = generate_pdf_report(input_folder, erste_marke)
-                    
-                    if error:
-                        st.error(f"{error}")
-                    elif pdf_buffer:
-                        st.success("PDF report generated successfully!")
-                        
-                        # Download button
-                        st.download_button(
-                            label="📥 Download PDF Report",
-                            data=pdf_buffer.getvalue(),
-                            file_name="Brand_Assets_Report.pdf",
-                            mime="application/pdf"
-                        )
-                        
-            else:
-                # Filename-based analysis (supports both asterisk and regular patterns)
-                marken_set, files_by_folder_and_brand, all_files = analyze_files_by_filename_patterns(input_folder)
-                
-                if not marken_set:
-                    st.error("No brands found in filenames.")
-                    st.info("Make sure your files are named with brand identifiers (e.g., 'Brand*product.jpg', 'Brand_product.jpg', or 'BrandName-item.png').")
-                    return
-                
-                st.success(f"Found brands from filenames: {', '.join(sorted(marken_set))}")
-                
-                # Show analysis preview
-                with st.expander("Analysis Preview"):
-                    total_files = len(all_files)
-                    st.write(f"**Total files analyzed: {total_files}**")
-                    for folder, brands in files_by_folder_and_brand.items():
-                        st.write(f"**Folder: {folder}**")
-                        for brand, files in brands.items():
-                            st.write(f"- {brand}: {len(files)} files")
-                
-                # Options
-                erste_marke = st.selectbox(
-                    "Which brand should appear first in the overview?",
-                    options=["Alphabetical order"] + sorted(list(marken_set))
-                )
-                erste_marke = erste_marke if erste_marke != "Alphabetical order" else None
-                
-                # Generate PDF button
-                if st.button("Generate PDF Report", type="primary"):
-                    with st.spinner("Generating PDF report..."):
-                        pdf_buffer, error = generate_filename_patterns_pdf_report(input_folder, erste_marke)
-                    
-                    if error:
-                        st.error(f"{error}")
-                    elif pdf_buffer:
-                        st.success("PDF report generated successfully!")
-                        
-                        # Download button
-                        st.download_button(
-                            label="📥 Download PDF Report",
-                            data=pdf_buffer.getvalue(),
-                            file_name="Brand_Assets_Report.pdf",
-                            mime="application/pdf"
-                        )
-        
-        except zipfile.BadZipFile:
-            st.error("Invalid zip file. Please upload a valid zip file.")
-        except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
-    
-    else:
-        st.info("👆 Please upload a zip file to get started.")
-        
-        # Instructions
-        with st.expander("📖 Instructions"):
-            st.markdown("""
-            **How to use this tool:**
-            
-            **Folder-based analysis:**
-            - Create folders named after your brands
-            - Place brand assets inside each brand folder
-            - Zip the entire structure
-            
-            **Filename-based analysis:**
-            - Name your files with brand identifiers at the beginning
-            - Supports multiple patterns: 'Brand*product.jpg', 'Brand_product.jpg', 'BrandName-item.png'
-            - Organize files in any folder structure you prefer
-            - The tool will extract brand names automatically from various naming patterns
-            - PDF will be organized by folder structure, grouped by brand
-            
-            **Supported file types:**
-            - **Images:** JPG, JPEG, PNG, BMP, GIF, TIFF, WEBP
-            - **Text files:** TXT, MD, CSV
-            """)
-
-
-def analyze_files_by_filename_patterns(input_folder):
-    """
-    Analyze files based on multiple filename patterns to extract brand names.
-    Supports patterns like: Brand*product, Brand_product, BrandName-item, etc.
-    Returns: (brands_set, files_by_folder_and_brand, all_files)
-    """
-    marken_set = set()
-    files_by_folder_and_brand = {}
-    all_files = []
-    
-    # Supported file extensions
-    image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp']
-    text_extensions = ['.txt', '.md', '.csv']
-    supported_extensions = image_extensions + text_extensions
-    
-    for root, dirs, files in os.walk(input_folder):
-        # Get relative folder path
-        relative_folder = os.path.relpath(root, input_folder)
-        if relative_folder == '.':
-            relative_folder = 'Root'
-        
-        for file in files:
-            file_path = os.path.join(root, file)
-            file_ext = os.path.splitext(file)[1].lower()
-            
-            # Skip unsupported files
-            if file_ext not in supported_extensions:
-                continue
-            
-            all_files.append(file_path)
-            
-            # Extract brand name from filename using multiple patterns
-            filename_without_ext = os.path.splitext(file)[0]
-            brand_name = None
-            
-            # Pattern 1: Brand*product (asterisk delimiter)
-            if '*' in filename_without_ext:
-                brand_name = filename_without_ext.split('*')[0].strip()
-            
-            # Pattern 2: Brand_product (underscore delimiter)
-            elif '_' in filename_without_ext:
-                brand_name = filename_without_ext.split('_')[0].strip()
-            
-            # Pattern 3: Brand-product (hyphen delimiter)
-            elif '-' in filename_without_ext:
-                brand_name = filename_without_ext.split('-')[0].strip()
-            
-            # Pattern 4: BrandProduct (camelCase - extract first capitalized word)
-            elif filename_without_ext and filename_without_ext[0].isupper():
-                # Find where the second capital letter starts (if any)
-                for i, char in enumerate(filename_without_ext[1:], 1):
-                    if char.isupper():
-                        brand_name = filename_without_ext[:i]
+                    if frame_idx >= num_frames:
                         break
-                else:
-                    # No second capital letter found, use whole filename
-                    brand_name = filename_without_ext
             
-            # Pattern 5: Brand followed by space
-            elif ' ' in filename_without_ext:
-                brand_name = filename_without_ext.split(' ')[0].strip()
-            
-            # If no pattern matches, use the whole filename as brand
-            else:
-                brand_name = filename_without_ext.strip()
-            
-            if brand_name and len(brand_name) > 0:  # Only process if brand name is not empty
-                marken_set.add(brand_name)
-                
-                # Initialize folder structure if needed
-                if relative_folder not in files_by_folder_and_brand:
-                    files_by_folder_and_brand[relative_folder] = {}
-                
-                if brand_name not in files_by_folder_and_brand[relative_folder]:
-                    files_by_folder_and_brand[relative_folder][brand_name] = []
-                
-                files_by_folder_and_brand[relative_folder][brand_name].append({
-                    'filename': file,
-                    'full_path': file_path,
-                    'extension': file_ext,
-                    'original_name': filename_without_ext
-                })
-    
-    return marken_set, files_by_folder_and_brand, all_files
+            if frame_idx >= num_frames:
+                break
+        
+        return pd.DataFrame(scene_data)
 
+def load_timm_model(model_name="inception_v4"):
+    """Mock function to load timm model"""
+    return None
 
-def generate_filename_patterns_pdf_report(input_folder, erste_marke=None):
-    """
-    Generate PDF report based on filename pattern analysis.
-    Creates a table-based layout similar to the expected output.
-    """
+def get_video_format(video_path):
+    """Get video format and FPS with complete error suppression"""
     try:
-        marken_set, files_by_folder_and_brand, all_files = analyze_files_by_filename_patterns(input_folder)
-        
-        if not marken_set:
-            return None, "No brands found in filenames using supported patterns."
-        
-        # Sort brands (put erste_marke first if specified)
-        sorted_brands = sorted(list(marken_set))
-        if erste_marke and erste_marke in sorted_brands:
-            sorted_brands.remove(erste_marke)
-            sorted_brands.insert(0, erste_marke)
-        
-        # Create PDF buffer
-        pdf_buffer = io.BytesIO()
-        doc = SimpleDocTemplate(pdf_buffer, pagesize=A4, topMargin=30, bottomMargin=30, leftMargin=30, rightMargin=30)
-        story = []
-        
-        # Process each folder
-        for folder_name in sorted(files_by_folder_and_brand.keys()):
-            folder_data = files_by_folder_and_brand[folder_name]
-            
-            # Folder header
-            folder_style = ParagraphStyle(
-                'FolderHeader',
-                parent=getSampleStyleSheet()['Heading1'],
-                fontSize=14,
-                spaceAfter=10,
-                textColor=colors.black,
-                fontName='Helvetica-Bold'
-            )
-            story.append(Paragraph(f"Folder: {folder_name}", folder_style))
-            
-            # Count files per brand for this folder
-            brand_counts = {}
-            for brand in sorted_brands:
-                if brand in folder_data:
-                    brand_counts[brand] = len(folder_data[brand])
-                else:
-                    brand_counts[brand] = 0
-            
-            # Create summary counts
-            summary_style = getSampleStyleSheet()['Normal']
-            summary_style.fontSize = 10
-            for i, brand in enumerate(sorted_brands, 1):
-                count = brand_counts[brand]
-                story.append(Paragraph(f"{i:02d} ({brand}): {count}", summary_style))
-            
-            total_files = sum(brand_counts.values())
-            story.append(Paragraph(f"Total: {total_files}", summary_style))
-            story.append(Spacer(1, 10))
-            
-            # Create table with brand headers
-            table_data = []
-            
-            # Header row with brand numbers and names
-            header_row = []
-            for i, brand in enumerate(sorted_brands, 1):
-                if brand_counts[brand] > 0:
-                    header_row.append(f"{i:02d} ({brand})")
-                else:
-                    header_row.append("")
-            
-            # Only include columns that have files
-            active_brands = [brand for brand in sorted_brands if brand_counts[brand] > 0]
-            if not active_brands:
-                story.append(Paragraph("No files found in this folder.", summary_style))
-                story.append(PageBreak())
-                continue
-            
-            # Rebuild header with only active brands
-            header_row = []
-            for i, brand in enumerate(sorted_brands, 1):
-                if brand in active_brands:
-                    header_row.append(f"{i:02d} ({brand})")
-            
-            table_data.append(header_row)
-            
-            # Find maximum number of files in any brand to determine table height
-            max_files = max([len(folder_data[brand]) for brand in active_brands])
-            
-            # Create rows for each file position
-            for file_index in range(max_files):
-                row = []
-                for brand in active_brands:
-                    if brand in folder_data and file_index < len(folder_data[brand]):
-                        file_info = folder_data[brand][file_index]
-                        file_path = file_info['full_path']
-                        filename = file_info['filename']
-                        file_ext = file_info['extension']
-                        
-                        if file_ext.lower() in ['.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp']:
-                            try:
-                                # Create image with filename
-                                img = Image(file_path)
-                                img_width, img_height = img.imageWidth, img.imageHeight
-                                
-                                # Scale image to fit in table cell
-                                max_size = 80
-                                if img_width > max_size or img_height > max_size:
-                                    scale_factor = min(max_size/img_width, max_size/img_height)
-                                    img.drawWidth = img_width * scale_factor
-                                    img.drawHeight = img_height * scale_factor
-                                
-                                # Create cell content with image and filename
-                                cell_content = [
-                                    img,
-                                    Paragraph(f"<font size=8>{filename}</font>", getSampleStyleSheet()['Normal'])
-                                ]
-                                row.append(cell_content)
-                                
-                            except Exception as e:
-                                row.append([Paragraph(f"<font size=8>Error: {filename}</font>", getSampleStyleSheet()['Normal'])])
-                        else:
-                            # Text file
-                            row.append([Paragraph(f"<font size=8>{filename}</font>", getSampleStyleSheet()['Normal'])])
-                    else:
-                        row.append("")
+        with suppress_stderr():
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened():
+                return "unknown", 25
                 
-                table_data.append(row)
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+            height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            cap.release()
             
-            # Create table
-            if len(header_row) > 0:
-                col_width = (doc.width) / len(header_row)
-                col_widths = [col_width] * len(header_row)
+            if width > height:
+                format_type = "horizontal"
+            elif height > width:
+                format_type = "vertical"
+            else:
+                format_type = "square"
                 
-                table = Table(table_data, colWidths=col_widths, repeatRows=1)
-                
-                # Table style
-                table_style = TableStyle([
-                    # Header style
-                    ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
-                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-                    ('FONTSIZE', (0, 0), (-1, 0), 10),
-                    # Grid
-                    ('GRID', (0, 0), (-1, -1), 1, colors.black),
-                    # Cell padding
-                    ('LEFTPADDING', (0, 0), (-1, -1), 3),
-                    ('RIGHTPADDING', (0, 0), (-1, -1), 3),
-                    ('TOPPADDING', (0, 0), (-1, -1), 3),
-                    ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
-                ])
-                
-                table.setStyle(table_style)
-                story.append(table)
+            return format_type, fps
+    except Exception as e:
+        return "unknown", 25
+
+def resize_image_maintain_aspect_ratio(image, max_length):
+    """Resize image to max length while maintaining aspect ratio"""
+    width, height = image.size
+    
+    if max(width, height) <= max_length:
+        return image
+    
+    if width > height:
+        new_width = max_length
+        new_height = int(height * max_length / width)
+    else:
+        new_height = max_length
+        new_width = int(width * max_length / height)
+    
+    return image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+
+def image_resize(image_path, max_length):
+    """Resize image to max length while maintaining aspect ratio"""
+    img = Image.open(image_path)
+    return resize_image_maintain_aspect_ratio(img, max_length)
+
+def get_frames(video_path, output_dir, video_format, max_image_length=500, extract_all_frames=False, display_name = None):
+    video_display_name = display_name if display_name else os.path.basename(video_path)
+    try:
+        with suppress_stderr():
+            cap = cv2.VideoCapture(video_path)
             
-            # Add page break between folders (except for the last one)
-            if folder_name != list(files_by_folder_and_brand.keys())[-1]:
-                story.append(PageBreak())
-        
-        # Build PDF
-        doc.build(story)
-        pdf_buffer.seek(0)
-        
-        return pdf_buffer, None
+            if not cap.isOpened():
+                st.error(f"❌ Could not open video file: {video_display_name}")
+                return []
+            
+            frame_paths = []
+            
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = int(cap.get(cv2.CAP_PROP_FPS))
+            
+            # Enhanced frame extraction to match notebook
+            if extract_all_frames:
+                # Extract every 5th frame for better coverage without overwhelming
+                frame_interval = max(1, 5)
+            else:
+                # Extract more frames than before - every 0.5 seconds instead of 1 second
+                frame_interval = max(1, fps // 2)
+            
+            extracted_count = 0
+            success_count = 0
+            
+            # Add progress tracking
+            total_frames_to_extract = len(range(0, frame_count, frame_interval))
+            progress_bar = st.progress(0)
+            
+            for i, frame_idx in enumerate(range(0, frame_count, frame_interval)):
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+                ret, frame = cap.read()
+                
+                if not ret:
+                    continue
+                    
+                # Convert BGR to RGB
+                try:
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    
+                    # Save frame with sequential numbering
+                    frame_filename = f"{success_count:06d}.jpg"
+                    frame_path = os.path.join(output_dir, frame_filename)
+                    
+                    # Convert to PIL and resize properly maintaining aspect ratio
+                    pil_image = Image.fromarray(frame_rgb)
+                    if max(pil_image.size) > max_image_length:
+                        pil_image = resize_image_maintain_aspect_ratio(pil_image, max_image_length)
+                    
+                    pil_image.save(frame_path, 'JPEG', quality=105, optimize=True, subsampling=0)
+
+                    frame_paths.append(frame_path)
+                    success_count += 1
+                    
+                except Exception as frame_error:
+                    # Skip problematic frames silently
+                    continue
+                
+                extracted_count += 1
+                
+                # Update progress
+                if i % 10 == 0:  # Update every 10 frames to avoid too frequent updates
+                    progress_bar.progress(min(i / total_frames_to_extract, 1.0))
+                
+                # Limit total frames to prevent memory issues
+                if success_count >= 1500:  # Reasonable limit
+                    #st.info(f"ℹ️ Reached frame limit of 500 frames for processing efficiency")
+                    break
+            
+            progress_bar.progress(1.0)
+            cap.release()
         
     except Exception as e:
-        return None, f"Error generating PDF: {str(e)}"
-def excel_extractor_tool():
-    st.header("Excel Image Extractor")
-    st.markdown("Upload Excel files (.xlsx) to extract embedded images from them.")
+        st.error(f"❌ Error during frame extraction: {str(e)}")
+        return []
     
-    # File upload for Excel files
-    uploaded_files = st.file_uploader(
-        "Choose Excel file(s)",
-        type=['xlsx'],
-        accept_multiple_files=True,
-        help="Upload one or more .xlsx files to extract embedded images.",
-        key="excel_upload"
-    )
+    return frame_paths
+
+def process_video(video_path, output_base_folder, project_name, n_scene_frames=3, image_length_max=500, extract_all_frames=False, original_filename=None):
+    """
+    Process a single video and extract scene frames
+    Now saves directly to video_name folder in the base output folder
+    """
     
-    if uploaded_files:
-        if st.button("Extract Images", type="primary", key="extract_btn"):
-            temp_dir = tempfile.mkdtemp()
-            all_extracted_files = []
-            total_images = 0
+    # Use original filename if provided, otherwise fall back to video_path basename
+    if original_filename:
+        video_name = original_filename
+    else:
+        video_name = os.path.basename(video_path)
+    
+    video_name_clean = os.path.splitext(video_name)[0]
+    
+    # Create output directory structure as video name directly in base folder
+    output_folder_video = os.path.join(output_base_folder, video_name_clean)
+    os.makedirs(output_folder_video, exist_ok=True)
+    
+    # Create temporary directory for intermediate processing
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        try:
+            # Get video format and FPS
+            video_format, fps = get_video_format(video_path)
+            
+            # Extract frames - enhanced extraction
+            st.info(f"📽️ Extracting frames from {video_name}...") 
+            extract_all_frames=extract_all_frames
+            frame_paths = get_frames(
+                video_path, 
+                tmp_dir, 
+                video_format, 
+                max_image_length=image_length_max,
+                extract_all_frames=extract_all_frames,
+                display_name=video_name  # ADD THIS
+            )
+            
+            if not frame_paths:
+                return None, "No frames could be extracted from the video"
+                
+            st.success(f"Extracted {len(frame_paths)} frames")
+            
+            # Create scene detector
+            scene_detector = MockSceneDetector(
+                video_path=video_path, 
+                frame_paths=frame_paths, 
+                fps=fps, 
+                debug_handler=None, 
+                verbose=False
+            )
+            
+            # Detect scenes with enhanced parameters
+            embedder = MockEmbedder(None)
+            scene_df = scene_detector.detect_scenes(n_scene_frames=n_scene_frames, embedder=embedder)
+            
+            # Add scene frame IDs
+            scene_df["scene_frame_id"] = scene_df["scene_image_path"].apply(
+                lambda p: int(os.path.splitext(os.path.basename(p))[0])
+            )
+            
+            unique_scenes = scene_df["scene_number"].unique().tolist()
+            st.success(f"Found {len(unique_scenes)} unique scenes with {len(scene_df)} total scene frames")
+            
+            # Copy ALL scene frames to output folder with proper naming
+            #st.info("💾 Preparing scene frames for download...")
+            scene_frames = scene_df["scene_image_path"].tolist()
+            copied_frame_paths = []
             
             progress_bar = st.progress(0)
-            status_text = st.empty()
             
-            for i, uploaded_file in enumerate(uploaded_files):
-                status_text.text(f"Processing {uploaded_file.name}...")
-                progress_bar.progress((i + 1) / len(uploaded_files))
-                
-                # Save uploaded file temporarily
-                temp_xlsx_path = os.path.join(temp_dir, uploaded_file.name)
-                with open(temp_xlsx_path, 'wb') as f:
-                    f.write(uploaded_file.getbuffer())
-                
-                # Create output directory for this file
-                output_dir = os.path.join(temp_dir, f"{Path(uploaded_file.name).stem}_images")
-                os.makedirs(output_dir, exist_ok=True)
-                
-                # Extract images
-                count, extracted_files, error = extract_images_from_xlsx(temp_xlsx_path, output_dir)
-                
-                if error:
-                    st.error(f"Error processing {uploaded_file.name}: {error}")
-                elif count > 0:
-                    st.success(f"Extracted {count} image(s) from {uploaded_file.name}")
-                    all_extracted_files.extend(extracted_files)
-                    total_images += count
-                else:
-                    st.warning(f"No images found in {uploaded_file.name}")
+            # Sequential numbering for output files as specified
+            frame_counter = 1
             
-            status_text.empty()
-            progress_bar.empty()
-            
-            if total_images > 0:
-                st.success(f"Total: {total_images} images extracted from {len(uploaded_files)} file(s)")
-                
-                # Create zip file with all extracted images
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    for file_path in all_extracted_files:
-                        # Get relative path for zip structure
-                        rel_path = os.path.relpath(file_path, temp_dir)
-                        zip_file.write(file_path, rel_path)
-                
-                zip_buffer.seek(0)
-                
-                # Download button for all extracted images
-                st.download_button(
-                    label="Download All Extracted Images (ZIP)",
-                    data=zip_buffer.getvalue(),
-                    file_name="extracted_images.zip",
-                    mime="application/zip"
-                )
-                
-                # Show preview of extracted images
-                with st.expander("Preview Extracted Images"):
-                    cols = st.columns(3)
-                    col_idx = 0
-                    
-                    for file_path in all_extracted_files[:12]:  
-                        try:
-                            with cols[col_idx % 3]:
-                                img = PILImage.open(file_path)
-                                st.image(img, caption=os.path.basename(file_path), use_column_width =True)
-                            col_idx += 1
-                        except Exception as e:
-                            st.write(f"Could not preview {os.path.basename(file_path)}")
-                    
-                    if len(all_extracted_files) > 12:
-                        st.info(f"Showing first 12 images. Total extracted: {len(all_extracted_files)}")
-            
-            else:
-                st.info("No images were found in the uploaded Excel file(s).")
-    
-    else:
-        st.info("👆 Please upload Excel file(s) to get started.")
-        
-        # Instructions for Excel extractor
-        with st.expander("📖 How to use Excel Image Extractor"):
-            st.markdown("""
-            **How it works:**
-            
-            1. Upload one or more Excel files (.xlsx format)
-            2. The tool will scan for embedded images in the Excel files
-            3. All found images will be extracted and made available for download
-            4. Images are packaged in a ZIP file for easy download
-            
-            **Note:** 
-            - Only .xlsx files are supported (not .xls)
-            - Images must be embedded in the Excel file (not linked)
-            - Common image formats (PNG, JPG, etc.) are extracted
-            """)
-
-def file_renamer_tool():
-    st.header("Brand File Renamer")
-    st.markdown("Upload a zip file containing brand folders to automatically rename files with brand prefixes.")
-    
-    # File upload
-    uploaded_file = st.file_uploader(
-        "Choose a ZIP file",
-        type=['zip'],
-        help="Upload a zip file containing your brand folders with assets.",
-        key="renamer_zip_upload"
-    )
-    
-    if uploaded_file is not None:
-        try:
-            # Extract zip file
-            with st.spinner("Extracting zip file..."):
-                temp_dir = extract_zip_to_temp(uploaded_file)
-            
-            # Find the actual input folder (in case zip has a root folder)
-            input_folder = Path(temp_dir)
-            items = os.listdir(temp_dir)
-            if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
-                input_folder = Path(temp_dir) / items[0]
-            
-            # Create output folder
-            output_folder = input_folder.parent / (input_folder.name + "_renamed")
-            output_folder.mkdir(exist_ok=True)
-            
-            # Process files
-            total_files = 0
-            processed_files = []
-            
-            for subfolder in input_folder.iterdir():
-                if subfolder.is_dir():
-                    markenname = subfolder.name
-                    new_subfolder = output_folder / markenname
-                    new_subfolder.mkdir(parents=True, exist_ok=True)
-                    
-                    for file in subfolder.iterdir():
-                        if file.is_file() and file.suffix.lower() in ALL_ALLOWED_EXTENSIONS:
-                            new_name = f"{markenname}_{file.name}"
-                            target_path = new_subfolder / new_name
-                            shutil.copy2(file, target_path)
-                            processed_files.append((file.name, new_name, markenname))
-                            total_files += 1
-            
-            if total_files > 0:
-                st.success(f"Successfully renamed and copied {total_files} files")
-                
-                # Show preview
-                with st.expander("📋 Preview renamed files"):
-                    preview_df = pd.DataFrame(
-                        processed_files[:20],  # Show first 20 files
-                        columns=["Original Name", "New Name", "Brand"]
-                    )
-                    st.dataframe(preview_df)
-                    
-                    if total_files > 20:
-                        st.info(f"Showing first 20 files. Total processed: {total_files}")
-                
-                # Create zip file with renamed files
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    for root, dirs, files in os.walk(output_folder):
-                        for file in files:
-                            file_path = Path(root) / file
-                            rel_path = os.path.relpath(file_path, output_folder)
-                            zip_file.write(file_path, rel_path)
-                
-                zip_buffer.seek(0)
-                
-                # Download button
-                st.download_button(
-                    label="📥 Download Renamed Files (ZIP)",
-                    data=zip_buffer.getvalue(),
-                    file_name="brand_files_renamed.zip",
-                    mime="application/zip"
-                )
-            else:
-                st.warning("No files were found to rename in the uploaded zip file.")
-        
-        except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
-    
-    else:
-        st.info("👆 Please upload a zip file to get started.")
-        
-        # Instructions
-        with st.expander("📖 Instructions"):
-            st.markdown("""
-            **How to use this tool:**
-            
-            1. Create folders named after your brands
-            2. Place brand assets inside each brand folder
-            3. Zip the entire structure
-            4. Upload the zip file
-            
-            **The tool will:**
-            - Create a new folder structure matching the original
-            - Rename all files with the brand prefix (e.g., "Brand1_filename.jpg")
-            - Provide a zip file with all renamed files
-            
-            **Supported file types:**
-            - Images: JPG, JPEG, PNG, BMP, GIF, TIFF, WEBP
-            - Text files: TXT, MD, CSV
-            """)
-
-def main():
-    st.title("🔧 Brand Assets Tools")
-
-    tab1, tab2, tab3 = st.tabs(["PDF Report Generator", "Excel Image Extractor", "Brand File Renamer"])
-
-    with tab1:
-        pdf_generator_tool()
-    with tab2:
-        excel_extractor_tool()
-    with tab3:
-        file_renamer_tool()
-
-def white_to_transparent_tool():
-    st.header("White Background to Transparent")
-    st.markdown("Upload images to convert white backgrounds to transparent.")
-    
-    # Options
-    col1, col2 = st.columns(2)
-    with col1:
-        crop_image = st.checkbox("Crop white background", value=False)
-    with col2:
-        overwrite = st.checkbox("Overwrite original files", value=False)
-    
-    # File upload
-    uploaded_files = st.file_uploader(
-        "Choose image files",
-        type=list(ALLOWED_IMAGE_EXTENSIONS),
-        accept_multiple_files=True,
-        help="Upload images to convert white backgrounds to transparent.",
-        key="transparent_upload"
-    )
-    
-    if uploaded_files:
-        if st.button("Process Images", type="primary"):
-            temp_dir = tempfile.mkdtemp()
-            processed_files = []
-            failed_files = []
-            
-            # Save uploaded files to temp dir
-            for uploaded_file in uploaded_files:
-                file_path = os.path.join(temp_dir, uploaded_file.name)
-                with open(file_path, 'wb') as f:
-                    f.write(uploaded_file.getbuffer())
-            
-            # Process images
-            progress_bar = st.progress(0)
-            status_text = st.empty()
-            
-            for i, uploaded_file in enumerate(uploaded_files):
-                status_text.text(f"Processing {uploaded_file.name}... ({i+1}/{len(uploaded_files)})")
-                progress_bar.progress((i + 1) / len(uploaded_files))
-                
-                try:
-                    img = PILImage.open(os.path.join(temp_dir, uploaded_file.name)).convert("RGBA")
-                    
-                    # Convert to numpy array for OpenCV processing
-                    img_array = np.array(img)
-                    
-                    if crop_image:
-                        # Crop image
-                        gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
-                        th, threshed = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
-                        
-                        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11,11))
-                        morphed = cv2.morphologyEx(threshed, cv2.MORPH_CLOSE, kernel)
-                        
-                        cnts, _ = cv2.findContours(morphed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                        if cnts:  # Only crop if contours are found
-                            cnt = sorted(cnts, key=cv2.contourArea)[-1]
-                            x,y,w,h = cv2.boundingRect(cnt)
-                            img_array = img_array[y:y+h, x:x+w]
-                    
-                    # Make white background transparent
-                    gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
-                    th, threshed = cv2.threshold(gray, 240, 255, cv2.THRESH_BINARY_INV)
-                    
-                    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (11,11))
-                    morphed = cv2.morphologyEx(threshed, cv2.MORPH_CLOSE, kernel)
-                    
-                    roi, _ = cv2.findContours(morphed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-                    
-                    mask = np.zeros(img_array.shape, img_array.dtype)
-                    if roi:  # Only proceed if contours are found
-                        cv2.fillPoly(mask, roi, (255,)*img_array.shape[2])
-                        masked_image = cv2.bitwise_and(img_array, mask)
-                        
-                        # Convert back to PIL Image
-                        result_img = PILImage.fromarray(masked_image, mode="RGBA")
-                        
-                        # Save the processed image
-                        new_filename = os.path.splitext(uploaded_file.name)[0] + ".png"
-                        processed_path = os.path.join(temp_dir, "processed_" + new_filename)
-                        result_img.save(processed_path)
-                        processed_files.append(processed_path)
-                    else:
-                        failed_files.append(uploaded_file.name)
-                except Exception as e:
-                    failed_files.append(uploaded_file.name)
-                    st.warning(f"Failed to process {uploaded_file.name}: {str(e)}")
-            
-            status_text.empty()
-            progress_bar.empty()
-            
-            if processed_files:
-                st.success(f"✅ Successfully processed {len(processed_files)} images")
-                
-                # Create zip file with processed images
-                zip_buffer = io.BytesIO()
-                with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                    for file_path in processed_files:
-                        zip_file.write(file_path, os.path.basename(file_path))
-                
-                zip_buffer.seek(0)
-                
-                # Download button
-                st.download_button(
-                    label="📥 Download Processed Images (ZIP)",
-                    data=zip_buffer.getvalue(),
-                    file_name="transparent_images.zip",
-                    mime="application/zip"
-                )
-                
-                # Show preview
-                with st.expander("🖼️ Preview Processed Images"):
-                    cols = st.columns(3)
-                    for i, file_path in enumerate(processed_files[:6]):  # Show max 6 images
-                        with cols[i % 3]:
-                            img = PILImage.open(file_path)
-                            st.image(img, caption=os.path.basename(file_path), use_column_width=True)
-                    
-                    if len(processed_files) > 6:
-                        st.info(f"Showing first 6 images. Total processed: {len(processed_files)}")
-            
-            if failed_files:
-                st.warning(f"⚠️ Failed to process {len(failed_files)} files: {', '.join(failed_files)}")
-    
-    else:
-        st.info("👆 Please upload image files to get started.")
-        
-        # Instructions
-        with st.expander("📖 Instructions"):
-            st.markdown("""
-            **How to use this tool:**
-            
-            1. Upload one or more image files
-            2. Choose processing options:
-               - Crop white background: Removes excess white space around the image
-               - Overwrite original files: Not applicable in this web version (always creates new files)
-            3. Click "Process Images"
-            4. Download the processed images with transparent backgrounds
-            
-            **Note:**
-            - Output images will always be in PNG format to support transparency
-            - Only white backgrounds will be made transparent (threshold of 240/255)
-            - Complex images may require manual adjustment for best results
-            """)
-
-def find_smallest_dimensions_tool():
-    st.header("Find Smallest Image Dimensions")
-    st.markdown("Analyze a folder to find images with the smallest width and height.")
-    
-    # File upload
-    uploaded_file = st.file_uploader(
-        "Choose a ZIP file with images",
-        type=['zip'],
-        help="Upload a zip file containing images to analyze.",
-        key="dimensions_zip_upload"
-    )
-    
-    if uploaded_file:
-        try:
-            # Extract zip file
-            with st.spinner("Extracting zip file..."):
-                temp_dir = extract_zip_to_temp(uploaded_file)
-            
-            # Find the actual input folder (in case zip has a root folder)
-            input_folder = temp_dir
-            items = os.listdir(temp_dir)
-            if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
-                input_folder = os.path.join(temp_dir, items[0])
-            
-            # Analyze images
-            with st.spinner("Analyzing images..."):
-                min_width = None
-                min_height = None
-                file_min_width = ""
-                file_min_height = ""
-                height_at_min_width = None
-                width_at_min_height = None
-                total_images = 0
-                
-                for root, dirs, files in os.walk(input_folder):
-                    for file in files:
-                        ext = os.path.splitext(file)[1].lower()
-                        if ext in ALLOWED_IMAGE_EXTENSIONS:
-                            path = os.path.join(root, file)
-                            try:
-                                with PILImage.open(path) as img:
-                                    width, height = img.size
-                                    total_images += 1
-                                    
-                                    if (min_width is None) or (width < min_width):
-                                        min_width = width
-                                        height_at_min_width = height
-                                        file_min_width = path
-                                    
-                                    if (min_height is None) or (height < min_height):
-                                        min_height = height
-                                        width_at_min_height = width
-                                        file_min_height = path
-                            except Exception as e:
-                                st.warning(f"Error processing {file}: {str(e)}")
-                
-                if min_width is not None and min_height is not None:
-                    st.success(f"Analyzed {total_images} images")
-                    
-                    col1, col2 = st.columns(2)
-                    with col1:
-                        st.subheader("Smallest Width")
-                        st.write(f"Dimensions: {min_width} × {height_at_min_width} px")
-                        st.image(file_min_width, caption=os.path.basename(file_min_width), use_column_width =True)
-                    
-                    with col2:
-                        st.subheader("Smallest Height")
-                        st.write(f"Dimensions: {width_at_min_height} × {min_height} px")
-                        st.image(file_min_height, caption=os.path.basename(file_min_height), use_column_width =True)
-                else:
-                    st.warning("No valid image files found in the uploaded zip.")
-        
-        except Exception as e:
-            st.error(f"An error occurred: {str(e)}")
-    
-    else:
-        st.info("👆 Please upload a zip file with images to analyze.")
-        
-        # Instructions
-        with st.expander("📖 Instructions"):
-            st.markdown("""
-            **How to use this tool:**
-            
-            1. Upload a zip file containing images
-            2. The tool will analyze all images in the folder and subfolders
-            3. It will find and display:
-               - The image with the smallest width
-               - The image with the smallest height
-            
-            **Supported image formats:**
-            - JPG, JPEG, PNG, BMP, GIF, TIFF, WEBP
-            """)
-
-def resize_with_transparent_canvas_tool():
-    st.header("Resize with Transparent Canvas")
-    st.markdown("Resize images to a target dimension while maintaining aspect ratio on transparent background.")
-    
-    # Set max allowed image dimension (pixels)
-    MAX_DIMENSION = 4000  # You can adjust this as needed
-    
-    # File upload with unique key
-    uploaded_file = st.file_uploader(
-        "Choose a ZIP file with images",
-        type=['zip'],
-        help="Upload a zip file containing images to resize.",
-        key="resize_transparent_upload"
-    )
-    
-    if uploaded_file:
-        # Options
-        col1, col2 = st.columns(2)
-        with col1:
-            mode = st.radio(
-                "Resize mode:",
-                ["By height", "By width"],
-                help="Resize all images to match either height or width while maintaining aspect ratio",
-                key="resize_mode_selector"
-            )
-        with col2:
-            target_value = st.number_input(
-                "Target dimension (pixels):",
-                min_value=10,      
-                max_value=MAX_DIMENSION,     
-                value=1000,         
-                step=10,
-                key="target_dimension_input"
-            )
-        
-        # Process button
-        if st.button("Process Images", type="primary", key="process_resize_transparent_images"):
-            try:
-                with st.spinner("Extracting zip file..."):
-                    temp_dir = extract_zip_to_temp(uploaded_file)
-                    input_folder = temp_dir
-                    items = os.listdir(temp_dir)
-                    if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
-                        input_folder = os.path.join(temp_dir, items[0])
-                
-                output_folder = os.path.join(temp_dir, "resized_transparent_output")
-                os.makedirs(output_folder, exist_ok=True)
-                
-                processed_count = 0
-                error_count = 0
-                skipped_count = 0
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                all_files = [
-                    os.path.join(root, file)
-                    for root, _, files in os.walk(input_folder)
-                    for file in files
-                    if os.path.splitext(file)[1].lower() in ALLOWED_IMAGE_EXTENSIONS
-                ]
-                
-                total_files = len(all_files)
-                
-                for i, file_path in enumerate(all_files):
-                    status_text.text(f"Processing {i+1}/{total_files}: {os.path.basename(file_path)}...")
-                    progress_bar.progress((i + 1) / total_files)
+            for i, scene_frame in enumerate(scene_frames):
+                if os.path.exists(scene_frame):
+                    # Output naming: video_name_01.jpg, video_name_02.jpg, etc.
+                    output_frame_name = f"{video_name_clean}_{frame_counter:02d}.jpg"
+                    scene_frame_output_path = os.path.join(output_folder_video, output_frame_name)
                     
                     try:
-                        with PILImage.open(file_path) as img:
-                            img = img.convert("RGBA")
-                            orig_w, orig_h = img.size
-                            
-                            if orig_w > MAX_DIMENSION or orig_h > MAX_DIMENSION:
-                                st.warning(f"Skipping {os.path.basename(file_path)}: {orig_w}x{orig_h}px exceeds max allowed size of {MAX_DIMENSION}px.")
-                                skipped_count += 1
-                                continue
-                            
-                            if mode == "By height":
-                                factor = target_value / orig_h
-                                new_h = target_value
-                                new_w = int(orig_w * factor)
-                            else:  # By width
-                                factor = target_value / orig_w
-                                new_w = target_value
-                                new_h = int(orig_h * factor)
-                            
-                            img_resized = img.resize((new_w, new_h), PILImage.LANCZOS)
-                            
-                            canvas = PILImage.new("RGBA", (new_w, new_h), (0, 0, 0, 0))
-                            x_offset = (canvas.width - img_resized.width) // 2
-                            y_offset = (canvas.height - img_resized.height) // 2
-                            canvas.paste(img_resized, (x_offset, y_offset), mask=img_resized)
-                            
-                            relative_path = os.path.relpath(file_path, input_folder)
-                            new_path = os.path.join(output_folder, os.path.splitext(relative_path)[0] + ".png")
-                            os.makedirs(os.path.dirname(new_path), exist_ok=True)
-                            canvas.save(new_path)
-                            processed_count += 1
-                    except Exception as e:
-                        error_count += 1
-                        st.warning(f"Error processing {os.path.basename(file_path)}: {str(e)}")
-                
-                status_text.empty()
-                progress_bar.empty()
-                
-                st.success(f"""
-                ✅ Done!
-                - Processed: {processed_count}
-                - Skipped (too large): {skipped_count}
-                - Errors: {error_count}
-                """)
-                
-                if processed_count > 0:
-                    zip_buffer = io.BytesIO()
-                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                        for root, _, files in os.walk(output_folder):
-                            for file in files:
-                                file_path = os.path.join(root, file)
-                                rel_path = os.path.relpath(file_path, output_folder)
-                                zip_file.write(file_path, rel_path)
-                    
-                    zip_buffer.seek(0)
-                    
-                    st.download_button(
-                        label="📥 Download Resized Images (ZIP)",
-                        data=zip_buffer.getvalue(),
-                        file_name="resized_transparent_images.zip",
-                        mime="application/zip",
-                        key="download_resized_transparent"
-                    )
-                    
-                    with st.expander("🖼️ Preview Resized Images"):
-                        sample_files = []
-                        for root, _, files in os.walk(output_folder):
-                            for file in files[:3]:
-                                if len(sample_files) < 6:
-                                    sample_files.append(os.path.join(root, file))
+                        # Copy and potentially resize while maintaining aspect ratio
+                        img = Image.open(scene_frame)
+                        if max(img.size) > image_length_max:
+                            img = resize_image_maintain_aspect_ratio(img, image_length_max)
                         
-                        if sample_files:
-                            cols = st.columns(3)
-                            for i, file_path in enumerate(sample_files):
-                                with cols[i % 3]:
-                                    img = PILImage.open(file_path)
-                                    st.image(img, caption=os.path.basename(file_path), use_column_width=True)
+                        img.save(scene_frame_output_path, 'JPEG', quality=105, optimize=True, subsampling=0)
+
+                        copied_frame_paths.append(scene_frame_output_path)
+                        frame_counter += 1
                         
-                        if processed_count > 6:
-                            st.info(f"Showing sample images. Total processed: {processed_count}")
+                    except Exception as copy_error:
+                        st.warning(f"⚠️ Error processing frame {i+1}: {copy_error}")
+                
+                progress_bar.progress((i + 1) / len(scene_frames))
             
-            except Exception as e:
-                st.error(f"An error occurred during processing: {str(e)}")
-    else:
-        st.info("👆 Please upload a zip file with images to resize.")
-        with st.expander("📖 Instructions"):
-            st.markdown("""
-            1. Upload a zip file containing images  
-            2. Choose resize mode (by height or width)  
-            3. Set target dimension  
-            4. Images larger than 4000x4000 pixels will be skipped  
-            5. Download your resized images
-            """)
+            st.success(f"✅ Successfully prepared {len(copied_frame_paths)} frames for download")
+            
+            # Create results summary
+            result_data = {
+                "video_name": video_name_clean,
+                "num_scenes": len(unique_scenes),
+                "num_scene_frames": len(scene_df),
+                "num_saved_frames": len(copied_frame_paths),
+                "output_path": output_folder_video,
+                "status": f"Success - prepared {len(copied_frame_paths)} images"
+            }
+            
+            return result_data, None
+            
+        except Exception as e:
+            return None, str(e)
 
+def save_frames_to_documents(output_base_folder, project_name):
+    """Save extracted frames directly to Documents/extracted_videos folder"""
+    try:
+        # Get the Documents/extracted_videos path
+        documents_extracted_path = get_documents_extracted_videos_path()
+        
+        # Create project folder in Documents/extracted_videos
+        project_folder = os.path.join(documents_extracted_path, project_name)
+        os.makedirs(project_folder, exist_ok=True)
+        
+        # Copy all extracted frames to the project folder
+        total_copied = 0
+        for root, dirs, files in os.walk(output_base_folder):
+            for file in files:
+                if file.endswith(('.jpg', '.jpeg', '.png')):
+                    source_path = os.path.join(root, file)
+                    # Maintain folder structure
+                    rel_path = os.path.relpath(root, output_base_folder)
+                    if rel_path == '.':
+                        dest_dir = project_folder
+                    else:
+                        dest_dir = os.path.join(project_folder, rel_path)
+                        os.makedirs(dest_dir, exist_ok=True)
+                    
+                    dest_path = os.path.join(dest_dir, file)
+                    shutil.copy2(source_path, dest_path)
+                    total_copied += 1
+        
+        return project_folder, total_copied
+    except Exception as e:
+        return None, 0
 
-
-def center_on_canvas_tool():
-    st.header("Center on Transparent Canvas")
-    st.markdown("Center small images on a transparent 500x500 canvas.")
+def main():
+    # Header
+    st.markdown('<h1 class="main-header">🎬 Video Scene Frame Extractor</h1>', unsafe_allow_html=True)
+    st.markdown("---")
     
-    # File upload - add unique key
-    uploaded_file = st.file_uploader(
-        "Choose a ZIP file with images",
-        type=['zip'],
-        help="Upload a zip file containing images to process.",
-        key="canvas_center_upload"  # Added unique key
-    )
-    
-    if uploaded_file:
-        canvas_size = st.number_input(
-            "Canvas size (pixels):",
-            min_value=100,
-            max_value=5000,
-            value=500,
-            step=10,
-            key="canvas_size_input"  # Added unique key
+    # Sidebar configuration
+    with st.sidebar:
+        st.header("⚙️ Configuration")
+        
+        project_name = st.text_input(
+            "Project Name", 
+            value="video_extraction_project",
+            help="Name for your project folder"
         )
         
-        # Add unique key to the button
-        if st.button("Process Images", type="primary", key="process_canvas_images"):
-            try:
-                # Extract zip file
-                with st.spinner("Extracting zip file..."):
-                    temp_dir = extract_zip_to_temp(uploaded_file)
-                    input_folder = temp_dir
-                    items = os.listdir(temp_dir)
-                    if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
-                        input_folder = os.path.join(temp_dir, items[0])
+        st.subheader("🎯 Extraction Settings")
+        
+        n_scene_frames = st.slider(
+            "Frames per Scene", 
+            min_value=1, 
+            max_value=15, 
+            value=5,
+            help="Number of frames to extract from each detected scene"
+        )
+        
+        image_length_max = st.slider(
+            "Max Image Size (pixels)", 
+            min_value=200, 
+            max_value=2100,
+            value=1000,
+            help="Maximum width or height of extracted frames"
+        )
+        
+        extract_all_frames = st.checkbox(
+            "Extract More Frames",
+            value=True,
+            help="Provides much denser frame coverage, especially for high frame rate videos"
+        )
+       
+    # Main content area
+    col1, col2 = st.columns([2, 1])
+    
+    with col1:
+        st.header("📤 Upload Videos")
+        
+        uploaded_files = st.file_uploader(
+            "Choose video files",
+            type=['mp4', 'avi', 'mov', 'mpeg', 'gif'],
+            accept_multiple_files=True,
+            help="Upload one or more video files to extract scene frames"
+        )
+        
+        if uploaded_files:
+            st.success(f"✅ {len(uploaded_files)} video(s) uploaded successfully!")
+            
+            # Display uploaded files
+            with st.expander("📁 Uploaded Files", expanded=True):
+                for file in uploaded_files:
+                    st.write(f"• {file.name} ({file.size / 1024 / 1024:.1f} MB)")
+    
+    with col2:
+        st.header("ℹ️ How it works")
+        st.markdown("""
+        1. **Upload** your video files
+        2. **Configure** extraction settings  
+        3. **Process** videos to detect scenes
+        4. **Download** your extracted frames as a ZIP file
+        """)
+    
+    # Processing section
+    if uploaded_files:
+        st.markdown("---")
+        
+        if st.button("🚀 Start Processing", type="primary", use_container_width=True):
+            # Check dependencies
+            deps_ok, deps_msg = import_dependencies()
+            if not deps_ok:
+                st.warning(f"⚠️ {deps_msg} - Using mock scene detection")
+            
+            # Create temporary output directory for processing
+            with tempfile.TemporaryDirectory() as output_base_folder:
+                results = []
                 
-                # Create output folder
-                output_folder = os.path.join(temp_dir, "canvas_output")
-                os.makedirs(output_folder, exist_ok=True)
-                
-                # Process images
-                processed_count = 0
-                progress_bar = st.progress(0)
-                status_text = st.empty()
-                
-                all_files = []
-                for root, dirs, files in os.walk(input_folder):
-                    for file in files:
-                        ext = os.path.splitext(file)[1].lower()
-                        if ext in ALLOWED_IMAGE_EXTENSIONS:
-                            all_files.append(os.path.join(root, file))
-                
-                for i, file_path in enumerate(all_files):
-                    status_text.text(f"Processing {os.path.basename(file_path)}... ({i+1}/{len(all_files)})")
-                    progress_bar.progress((i + 1) / len(all_files))
+                # Process each video
+                for i, uploaded_file in enumerate(uploaded_files):
+                    st.markdown(f"### Processing Video {i+1}/{len(uploaded_files)}: {uploaded_file.name}")
+                    
+                    # Save uploaded file temporarily
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(uploaded_file.name)[1]) as tmp_file:
+                        tmp_file.write(uploaded_file.read())
+                        tmp_video_path = tmp_file.name
                     
                     try:
-                        with PILImage.open(file_path) as img:
-                            width, height = img.size
-                            
-                            if width < canvas_size and height < canvas_size:
-                                # Create transparent canvas
-                                canvas = PILImage.new('RGBA', (canvas_size, canvas_size), (255, 255, 255, 0))
-                                
-                                # Convert image to RGBA if needed
-                                if img.mode != 'RGBA':
-                                    img = img.convert('RGBA')
-                                
-                                # Center image on canvas
-                                paste_x = (canvas_size - width) // 2
-                                paste_y = (canvas_size - height) // 2
-                                canvas.paste(img, (paste_x, paste_y), img)
-                                
-                                # Save processed image
-                                new_filename = os.path.splitext(os.path.basename(file_path))[0] + ".png"
-                                output_path = os.path.join(output_folder, new_filename)
-                                canvas.save(output_path)
-                                processed_count += 1
-                    except Exception as e:
-                        st.warning(f"Error processing {os.path.basename(file_path)}: {str(e)}")
-                
-                status_text.empty()
-                progress_bar.empty()
-                
-                if processed_count > 0:
-                    st.success(f"✅ Successfully processed {processed_count} images")
-                    
-                    # Create zip file with processed images
-                    zip_buffer = io.BytesIO()
-                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                        for root, dirs, files in os.walk(output_folder):
-                            for file in files:
-                                file_path = os.path.join(root, file)
-                                rel_path = os.path.relpath(file_path, output_folder)
-                                zip_file.write(file_path, rel_path)
-                    
-                    zip_buffer.seek(0)
-                    
-                    # Download button
-                    st.download_button(
-                        label="📥 Download Processed Images (ZIP)",
-                        data=zip_buffer.getvalue(),
-                        file_name="centered_images.zip",
-                        mime="application/zip"
-                    )
-                    
-                    # Show preview
-                    with st.expander("🖼️ Preview Processed Images"):
-                        sample_files = []
-                        for root, dirs, files in os.walk(output_folder):
-                            for file in files[:3]:  # Get first 3 files from each folder
-                                if len(sample_files) < 6:  # Max 6 samples
-                                    sample_files.append(os.path.join(root, file))
-                        
-                        cols = st.columns(3)
-                        for i, file_path in enumerate(sample_files):
-                            with cols[i % 3]:
-                                img = PILImage.open(file_path)
-                                st.image(img, caption=os.path.basename(file_path), use_column_width=True)
-                        
-                        if processed_count > 6:
-                            st.info(f"Showing sample images. Total processed: {processed_count}")
-                else:
-                    st.warning("No images were processed (all images were already larger than the canvas size).")
-            
-            except Exception as e:
-                st.error(f"An error occurred: {str(e)}")
-    
-    else:
-        st.info("👆 Please upload a zip file with images to process.")
-        
-        # Instructions
-        with st.expander("📖 Instructions"):
-            st.markdown("""
-            **How to use this tool:**
-            
-            1. Upload a zip file containing images
-            2. Set the canvas size (default is 500x500 pixels)
-            3. Click "Process Images"
-            4. Download the processed images
-            
-            **Features:**
-            - Centers images smaller than canvas size on transparent background
-            - Images larger than canvas size are skipped
-            - Outputs PNG files to preserve transparency
-            - Preserves folder structure
-            
-            **Note:**
-            - Only images smaller than the specified canvas size will be processed
-            - Original aspect ratio is maintained
-            """)
-
-def extract_zip_to_temp(uploaded_file):
-    """Extract uploaded zip file to temporary directory"""
-    temp_dir = tempfile.mkdtemp()
-    with zipfile.ZipFile(uploaded_file, 'r') as zip_ref:
-        zip_ref.extractall(temp_dir)
-    return temp_dir
-
-def extract_brand(file_stem):
-    """Extract brand name from filename using pattern matching"""
-    parts = re.split(r'[ _\-]', file_stem)
-    return re.sub(r'[^a-z0-9]', '', parts[0].lower()) if parts else "unknown"
-
-def clean_letters_only(text):
-    return re.sub(r'[^A-Za-z]', '', text)
-
-def get_cleaned_filename_without_brand(filename, brand):
-    full_letters = clean_letters_only(Path(filename).stem.lower())
-    return full_letters.replace(brand, '', 1)
-
-def get_asset_cell(file_path, filename, col_count):
-    """Create optimized asset cell for PDF with better image handling"""
-    ext = Path(file_path).suffix.lower()
-    styles = getSampleStyleSheet()
-    
-    try:
-        if ext in ALLOWED_IMAGE_EXTENSIONS:
-            with PILImage.open(file_path) as img:
-                orig_width, orig_height = img.size
-                available_width = A4[0] - 40
-                max_width = available_width / col_count
-                max_height = 120
-
-                aspect_ratio = orig_width / orig_height
-                width = max_width
-                height = width / aspect_ratio
-
-                if height > max_height:
-                    height = max_height
-                    width = height * aspect_ratio
-
-                buffer = io.BytesIO()
-                img.convert("RGB").save(buffer, format='PNG')
-                buffer.seek(0)
-                rl_img = RLImage(buffer, width=width, height=height)
-
-                frame = KeepInFrame(max_width, max_height + 30, content=[
-                    rl_img,
-                    Paragraph(filename, styles['Normal'])
-                ], hAlign='CENTER')
-
-                return frame
-        else:
-            return Paragraph(f"{filename}", styles['Normal'])
-    except Exception as e:
-        return Paragraph(f"[Image Error]<br/>{filename}", styles['Normal'])
-
-def analyze_files_by_filename(input_folder):
-    """Analyze files by extracting brand names from filenames"""
-    dateien = []
-    marken_set = set()
-    renamed_files_by_folder_and_marke = defaultdict(lambda: defaultdict(list))
-
-    for subfolder in sorted(Path(input_folder).iterdir()):
-        if not subfolder.is_dir():
-            continue
-
-        for file in sorted(subfolder.iterdir()):
-            if file.suffix.lower() not in ALL_ALLOWED_EXTENSIONS:
-                continue
-            marke = extract_brand(file.stem)
-            marken_set.add(marke)
-            dateien.append({
-                "original_file": file,
-                "original_folder": subfolder.name,
-                "marke": marke
-            })
-
-    for eintrag in dateien:
-        orig = eintrag["original_file"]
-        marke = eintrag["marke"]
-        folder_name = eintrag["original_folder"]
-        renamed_files_by_folder_and_marke[folder_name][marke].append((orig, orig.name))
-
-    return marken_set, renamed_files_by_folder_and_marke, dateien
-
-def generate_filename_based_pdf_report(input_folder, erste_marke=None):
-    """Generate PDF report based on filename brand analysis"""
-    marken_set, renamed_files_by_folder_and_marke, all_files = analyze_files_by_filename(input_folder)
-    
-    if not marken_set:
-        return None, "No brands found in filenames."
-
-    # Create brand index
-    marken_index = {}
-    if erste_marke and erste_marke in marken_set:
-        marken_index[erste_marke] = "01"
-        aktuelle_nummer = 2
-        for marke in sorted(marken_set):
-            if marke != erste_marke:
-                marken_index[marke] = f"{aktuelle_nummer:02d}"
-                aktuelle_nummer += 1
-    else:
-        for i, marke in enumerate(sorted(marken_set), 1):
-            marken_index[marke] = f"{i:02d}"
-
-    # Generate PDF
-    pdf_buffer = io.BytesIO()
-    doc = SimpleDocTemplate(pdf_buffer, pagesize=A4, leftMargin=20, rightMargin=20, topMargin=40, bottomMargin=30)
-    elements = []
-    styles = getSampleStyleSheet()
-
-    nummer_zu_marke = {v: k for k, v in marken_index.items()}
-    marken_spalten = sorted(nummer_zu_marke.items())
-
-    for folder in sorted(renamed_files_by_folder_and_marke):
-        elements.append(Paragraph(f"<b>Folder: {folder}</b>", styles['Heading2']))
-
-        abschnitt = renamed_files_by_folder_and_marke[folder]
-        total = 0
-        lines = []
-        for nummer, marke in marken_spalten:
-            count = len(abschnitt.get(marke, []))
-            total += count
-            lines.append(f"{nummer} ({marke}): {count}")
-        lines.append(f"Total: {total}")
-        elements.append(Paragraph("<br/>".join(lines), styles['Normal']))
-        elements.append(Spacer(1, 10))
-
-        headers = [f"{nummer} ({marke})" for nummer, marke in marken_spalten]
-        data = [headers]
-        col_data = []
-        max_rows = 0
-        for _, marke in marken_spalten:
-            eintraege = abschnitt.get(marke, [])
-            zellen = [get_asset_cell(p, n, len(headers)) for p, n in eintraege]
-            col_data.append(zellen)
-            max_rows = max(max_rows, len(zellen))
-
-        for i in range(max_rows):
-            row = []
-            for col in col_data:
-                row.append(col[i] if i < len(col) else "")
-            data.append(row)
-
-        col_width = (A4[0] - 40) / len(headers)
-        t = Table(data, colWidths=[col_width] * len(headers))
-        t.setStyle(TableStyle([
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
-            ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
-            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-        ]))
-        elements.append(t)
-        elements.append(PageBreak())
-
-    # Total overview
-    elements.append(Paragraph("<b>Total Overview</b>", styles['Heading2']))
-    global_counts = defaultdict(int)
-    for folder_data in renamed_files_by_folder_and_marke.values():
-        for marke, daten in folder_data.items():
-            global_counts[marke] += len(daten)
-    
-    gesamt = 0
-    summary = []
-    for nummer, marke in marken_spalten:
-        count = global_counts[marke]
-        summary.append(f"{marke}: {count} assets")
-        gesamt += count
-    summary.append(f"Total number of all assets: {gesamt}")
-    elements.append(Paragraph("<br/>".join(summary), styles['Normal']))
-
-    try:
-        doc.build(elements)
-        pdf_buffer.seek(0)
-        return pdf_buffer, None
-    except Exception as e:
-        return None, f"Error generating PDF: {str(e)}"
-
-def generate_excel_report(output_folder: Path, marken_index: dict, file_to_factorgroup: dict):
-    final_excel_path = output_folder / "IcAt_Overview_Final.xlsx"
-
-    nummer_zu_marke = {v: k for k, v in marken_index.items()}
-    data = []
-    for file in sorted(output_folder.iterdir()):
-        if file.is_file() and file.suffix.lower() in {'.png', '.txt', '.csv', '.md'}:
-            name = file.stem
-            match = re.match(r"(\d{2})B(\d{2})([a-z0-9]+)", name, re.IGNORECASE)
-            if match:
-                markennummer, blocknummer, marke = match.groups()
-                factor = nummer_zu_marke.get(markennummer, marke)
-                factorgroup = file_to_factorgroup.get(file.name, f"{blocknummer}Unknown")
-                data.append({
-                    "factor": factor,
-                    "factorgroup": factorgroup,
-                    "ID": name
-                })
-
-    df_assets = pd.DataFrame(data, columns=["factor", "factorgroup", "ID"])
-
-    reordered_data = []
-    for _, row in df_assets.iterrows():
-        raw_fg = str(row["factorgroup"])
-        group_prefix = raw_fg[:2]
-        try:
-            group = str(int(group_prefix))
-        except ValueError:
-            group = group_prefix
-
-        reordered_data.append({
-            "Group": group,
-            "factor": row["factorgroup"],
-            "factorgroup": row["factor"],
-            "ID": row["ID"]
-        })
-
-    df_reordered = pd.DataFrame(reordered_data, columns=["Group", "factor", "factorgroup", "ID"])
-
-    with pd.ExcelWriter(final_excel_path, engine='openpyxl') as writer:
-        df_assets.to_excel(writer, index=False, sheet_name="Assets")
-        df_reordered.to_excel(writer, index=False, sheet_name="Reordered")
-
-    return final_excel_path
-
-def process_files(input_folder, marken_index, output_root):
-    """Process and rename files according to brand numbering"""
-    dateien = []
-    renamed_files_by_folder_and_marke = defaultdict(lambda: defaultdict(list))
-    file_to_factorgroup = {}
-
-    for subfolder in sorted(Path(input_folder).iterdir()):
-        if not subfolder.is_dir():
-            continue
-        blocknummer = re.sub(r'\D', '', subfolder.name)[:2].zfill(2)
-        
-        for file in sorted(subfolder.iterdir()):
-            if file.suffix.lower() not in ALL_ALLOWED_EXTENSIONS:
-                continue
-            marke = extract_brand(file.stem)
-            
-            markennummer = marken_index[marke]
-            cleaned = get_cleaned_filename_without_brand(file.name, marke)
-            
-            neuer_name = f"{markennummer}B{blocknummer}{marke}{cleaned}{file.suffix.lower()}"
-            ziel = output_root / neuer_name
-
-            if file.suffix.lower() in ALLOWED_IMAGE_EXTENSIONS:
-                with PILImage.open(file) as img:
-                    img.convert("RGB").save(ziel, format='PNG')
-            else:
-                shutil.copy2(file, ziel)
-
-            renamed_files_by_folder_and_marke[subfolder.name][marke].append((ziel, neuer_name))
-            file_to_factorgroup[neuer_name] = subfolder.name
-
-    return renamed_files_by_folder_and_marke, file_to_factorgroup
-
-def brand_renamer_tool():
-    st.header("Advanced Brand File Processor")
-    st.markdown("Automatically rename and organize brand assets with numbering and generate reports.")
-    
-    uploaded_file = st.file_uploader(
-        "Choose a ZIP file",
-        type=['zip'],
-        help="Upload a zip file containing your brand folders with assets."
-    )
-    
-    if uploaded_file:
-        with st.spinner("Extracting and analyzing files..."):
-            temp_dir = extract_zip_to_temp(uploaded_file)
-            input_folder = Path(temp_dir)
-            
-            items = os.listdir(temp_dir)
-            if len(items) == 1 and os.path.isdir(os.path.join(temp_dir, items[0])):
-                input_folder = Path(temp_dir) / items[0]
-            
-            output_folder = Path(temp_dir) / "output"
-            output_folder.mkdir(exist_ok=True)
-            
-            marken_set, _, _ = analyze_files_by_filename(input_folder)
-            
-            if not marken_set:
-                st.error("No brands found in the uploaded files.")
-                return
-            
-            st.success(f"Detected brands: {', '.join(sorted(marken_set))}")
-            
-            # Brand numbering selection
-            st.subheader("Brand Numbering")
-            erste_marke = st.selectbox(
-                "Which brand should be number 01?",
-                options=sorted(marken_set),
-                index=0
-            )
-            
-            marken_index = {erste_marke: "01"}
-            aktuelle_nummer = 2
-            for marke in sorted(marken_set):
-                if marke != erste_marke:
-                    marken_index[marke] = f"{aktuelle_nummer:02d}"
-                    aktuelle_nummer += 1
-            
-            if st.button("Process Files and Generate Reports", type="primary"):
-                with st.spinner("Processing files..."):
-                    # Process and rename files
-                    renamed_files, file_to_factorgroup = process_files(
-                        input_folder, 
-                        marken_index, 
-                        output_folder
-                    )
-                    
-                    pdf_buffer, error = generate_filename_based_pdf_report(input_folder, erste_marke)
-                    if error:
-                        st.error(f"PDF generation failed: {error}")
-                    
-                    excel_path = generate_excel_report(output_folder, marken_index, file_to_factorgroup)
-                    
-                    zip_buffer = io.BytesIO()
-                    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-                        for file in output_folder.iterdir():
-                            zip_file.write(file, file.name)
-                    
-                    zip_buffer.seek(0)
-                
-                st.success("Processing complete!")
-                
-                col1, col2, col3 = st.columns(3)
-                
-                with col1:
-                    if pdf_buffer:
-                        st.download_button(
-                            label="📥 Download PDF Report",
-                            data=pdf_buffer.getvalue(),
-                            file_name="Brand_Assets_Report.pdf",
-                            mime="application/pdf"
+                        # Process the video
+                        result, error = process_video(
+                            tmp_video_path, 
+                            output_base_folder,
+                            project_name,
+                            n_scene_frames=n_scene_frames,
+                            image_length_max=image_length_max,
+                            extract_all_frames=extract_all_frames,
+                            original_filename=uploaded_file.name
                         )
+                        
+                        if error:
+                            st.error(f"❌ Error processing {uploaded_file.name}: {error}")
+                            results.append({
+                                "video_name": uploaded_file.name,
+                                "status": f"Error: {error}",
+                                "num_scenes": 0,
+                                "num_scene_frames": 0,
+                                "num_saved_frames": 0
+                            })
+                        else:
+                            results.append(result)
+                            
+                    except Exception as e:
+                        st.error(f"❌ Unexpected error processing {uploaded_file.name}: {str(e)}")
+                        results.append({
+                            "video_name": uploaded_file.name,
+                            "status": f"Error: {str(e)}",
+                            "num_scenes": 0,
+                            "num_scene_frames": 0,
+                            "num_saved_frames": 0
+                        })
+                    finally:
+                        # Clean up temporary file
+                        if os.path.exists(tmp_video_path):
+                            os.unlink(tmp_video_path)
+                            
+                    st.markdown("---")
                 
-                with col2:
-                    st.download_button(
-                        label="📊 Download Excel Report",
-                        data=open(excel_path, 'rb').read(),
-                        file_name="Brand_Assets_Overview.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                    )
+                # Display results summary
+                st.header("📊 Processing Results")
                 
-                with col3:
-                    st.download_button(
-                        label="📦 Download Processed Files",
-                        data=zip_buffer.getvalue(),
-                        file_name="Brand_Assets_Processed.zip",
-                        mime="application/zip"
-                    )
-                
-                shutil.rmtree(temp_dir)
-    else:
-        st.info("👆 Please upload a zip file to get started.")
-        
-        with st.expander("📖 Instructions"):
-            st.markdown("""
-            **How to use this tool:**
-            
-            1. Prepare a zip file with:
-               - Subfolders for each brand (optional)
-               - Files named with brand identifiers (e.g., "nike_shoe.jpg")
-            2. Upload the zip file
-            3. Select which brand should be numbered "01"
-            4. Click "Process Files" to:
-               - Rename files with brand numbering
-               - Generate PDF and Excel reports
-               - Download processed files
-            
-            **Output Format:**
-            - `01B00nikefilename.png` (BrandNumber + Block + BrandName + OriginalName)
-            """)
-def main():
-    st.title("🔧 Brand Assets Tools")
+                if results:
+                    results_df = pd.DataFrame(results)
+                    st.dataframe(results_df, use_container_width=True)
+                    
+                    # Calculate summary statistics
+                    successful_videos = len([r for r in results if "Success" in r.get("status", "")])
+                    total_scenes = sum([r.get("num_scenes", 0) for r in results])
+                    total_frames = sum([r.get("num_saved_frames", 0) for r in results])
+                    
+                    col1, col2, col3, col4 = st.columns(4)
+                    with col1:
+                        st.metric("Videos Processed", f"{successful_videos}/{len(uploaded_files)}")
+                    with col2:
+                        st.metric("Total Scenes", total_scenes)
+                    with col3:
+                        st.metric("Total Frames", total_frames)
+                    with col4:
+                        avg_frames = total_frames / successful_videos if successful_videos > 0 else 0
+                        st.metric("Avg Frames/Video", f"{avg_frames:.1f}")
+                    
+                    # Create download if successful
+                    if successful_videos > 0:
+                        st.markdown("# Processing Complete!")
+                   
+                        with st.spinner("📦 Creating download package..."):
+                            try:
+                                # Create ZIP file for download
+                                zip_content = create_zip_download(output_base_folder, project_name)
+                                
+                                if zip_content:
+                                    st.success(f"✅ {total_frames} frames ready for download!")
+                                    
+                                    # Download button
+                                    st.download_button(
+                                        label="📥 Download Extracted Frames",
+                                        data=zip_content,
+                                        file_name=f"{project_name}_extracted_frames.zip",
+                                        mime="application/zip",
+                                        use_container_width=True
+                                    )
+                                    
+                                else:
+                                    st.error("❌ Error creating download package")
+                                    
+                            except Exception as e:
+                                st.error(f"❌ Error preparing download: {str(e)}")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
-        "PDF Report Generator", 
-        "Excel Image Extractor", 
-        "Brand File Renamer",
-        "White to Transparent",
-        "Find Smallest Dimensions",
-        "Resize with Transparent Canvas",
-        "Center on Canvas",
-        "Advanced Brand Processor"
-    ])
-
-    with tab1:
-        pdf_generator_tool()
-    with tab2:
-        excel_extractor_tool()
-    with tab3:
-        file_renamer_tool()
-    with tab4:
-        white_to_transparent_tool()
-    with tab5:
-        find_smallest_dimensions_tool()
-    with tab6:
-        resize_with_transparent_canvas_tool()
-    with tab7:
-        center_on_canvas_tool()
-    with tab8:
-        brand_renamer_tool()
+                else:
+                    st.warning("⚠️ No results to display.")
+    
+    # Footer
+    st.markdown("---")
+    st.markdown(
+        "<div style='text-align: center; color: #666; font-size: 0.8rem;'>"
+        "Internal Decode App"
+        "</div>", 
+        unsafe_allow_html=True
+    )
 
 if __name__ == "__main__":
     main()
