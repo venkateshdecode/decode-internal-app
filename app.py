@@ -33,7 +33,6 @@ os.environ['OPENCV_LOG_LEVEL'] = 'SILENT'
 os.environ['OPENCV_VIDEOIO_DEBUG'] = '0'
 os.environ['OPENCV_VIDEOIO_PRIORITY_MSMF'] = '0'
 os.environ['OPENCV_VIDEOIO_PRIORITY_INTEL_MFX'] = '0'
-cv2.setLogLevel(0)
 
 # Suppress all logging
 logging.getLogger().setLevel(logging.CRITICAL)
