@@ -1,12 +1,12 @@
 ---
 title: Video Frame Extractor
-emoji: 🚀
-colorFrom: red
-colorTo: red
-sdk: docker
-app_port: 8501
-tags:
-- streamlit
+emoji: 🔧
+colorFrom: blue
+colorTo: green
+sdk: streamlit
+sdk_version: 1.53.0
+app_file: app.py
 pinned: false
-short_description: Streamlit template space
+license: mit
+python_version: 3.12
 ---
