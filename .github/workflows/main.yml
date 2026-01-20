@@ -18,4 +18,4 @@ jobs:
       - name: Push to hub
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: git push https://DecodeMarketing:$HF_TOKEN@huggingface.co/spaces/DecodeMarketing/video_frame_extractor main
+        run: git push https://DecodeMarketing:$HF_TOKEN@huggingface.co/spaces/DecodeMarketing/video_frame main
