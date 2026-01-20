@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C \"c:\\\\Users\\\\venkatesh\\\\decode-internal-app\" pull --rebase origin main)",
+      "Bash(git -C \"c:\\\\Users\\\\venkatesh\\\\decode-internal-app\" push origin main)"
+    ]
+  }
+}
