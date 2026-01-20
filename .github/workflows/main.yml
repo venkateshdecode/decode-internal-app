@@ -1,3 +1,4 @@
+
 name: Sync to Hugging Face hub
 on:
   push:
@@ -17,4 +18,4 @@ jobs:
       - name: Push to hub
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: git push --force https://DecodeMarketing:$HF_TOKEN@huggingface.co/spaces/DecodeMarketing/video_frame_extractor main
+        run: git push https://DecodeMarketing:$HF_TOKEN@huggingface.co/spaces/DecodeMarketing/video_frame_extractor main
